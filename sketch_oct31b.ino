@@ -48,11 +48,12 @@ static const size_t I2S_READ_BYTES = 8192;
 static const unsigned long RECORD_TIMEOUT_MS = 8000UL; // 8 seconds
 static const unsigned long POSTROLL_MS = 200UL;
 
-// Playback robustness
-static const size_t PLAY_READ_BUF = 4 * 1024;       // 4KB read buffer (increased for better throughput)
-static const size_t RING_BUFFER_SIZE = (size_t)(1.3 * 1024 * 1024); // 1.3 MB ring buffer
-static const size_t INITIAL_BUFFER_SIZE = 256 * 1024; // 256KB initial buffer before starting playback
-static const size_t SMALL_FILE_THRESHOLD = 256 * 1024; // Files < 256KB: full download, >= 256KB: parallel
+// Playback robustness - Real-time streaming mode (event-driven)
+static const size_t PLAY_READ_BUF = 4 * 1024;       // 4KB read buffer
+static const size_t RING_BUFFER_SIZE = 64 * 1024;   // 64KB ring buffer for real-time streaming
+static const size_t MIN_STREAM_BUFFER = 12 * 1024;   // 12KB minimum buffer before starting playback (more stable start)
+static const size_t LOW_BUFFER_THRESHOLD = 10 * 1024; // 10KB - if below this, pause playback and fill buffer
+static const size_t RESUME_BUFFER_THRESHOLD = 18 * 1024; // 18KB - resume playback when buffer reaches this (achievable threshold)
 static const unsigned long PLAY_STATS_INTERVAL_MS = 1000UL;
 
 // Audio filters
@@ -743,6 +744,18 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     if(playbackBuf) free(playbackBuf);
     uninstallI2STX(); free(hdr); http.end(); return;
   }
+  
+  // Pre-allocate stereoScratch to maximum size needed (READ_BUF * 2 for mono-to-stereo conversion)
+  // This prevents heap corruption from reallocation during active playback
+  const size_t MAX_STEREO_BUF = READ_BUF * 2; // Maximum stereo buffer size needed
+  if(!stereoScratch.ensure(MAX_STEREO_BUF)){
+    Serial.println("[PLAY] stereoScratch pre-allocation failed");
+    ringBuf.deinit();
+    free(httpReadBuf);
+    free(playbackBuf);
+    uninstallI2STX(); free(hdr); http.end(); return;
+  }
+  Serial.printf("[PLAY] Pre-allocated stereoScratch: %.1fkB\n", MAX_STEREO_BUF / 1024.0f);
 
   // Streaming telemetry
   size_t statsTotalHttp = 0;
@@ -767,106 +780,42 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
   }
   
-  // Determine if file is small (< 256KB) or large (>= 256KB)
-  bool isSmallFile = false;
-  if(expectedTotalBytes > 0){
-    size_t headerSize = pcmStart;
-    size_t expectedDataBytes = expectedTotalBytes > headerSize ? (expectedTotalBytes - headerSize) : expectedTotalBytes;
-    isSmallFile = (expectedDataBytes < SMALL_FILE_THRESHOLD);
-    Serial.printf("[PLAY] File size: %.1fkB - %s\n", 
-      expectedDataBytes / 1024.0f,
-      isSmallFile ? "SMALL (full download)" : "LARGE (parallel download+playback)");
-  } else {
-    // No Content-Length - assume large file, use parallel approach
-    isSmallFile = false;
-    Serial.println("[PLAY] No Content-Length - using parallel download+playback");
-  }
+  // ===== DIRECT STREAMING: Minimal buffer, then continuous download+playback =====
+  Serial.printf("[PLAY][STREAM] Direct streaming mode - minimal buffer (%.1fkB) then continuous playback\n",
+    MIN_STREAM_BUFFER / 1024.0f);
   
-  // ===== PHASE 1: INITIAL BUFFER OR FULL DOWNLOAD =====
   unsigned long downloadStart = millis();
   bool downloadComplete = false;
-  bool playbackStarted = false;
-  size_t totalDownloaded = firstBody;
+  bool rainbowStarted = false;
   
-  if(isSmallFile){
-    // Small file: Download entire file first, then play
-    Serial.printf("[PLAY][DOWNLOAD] Small file - downloading fully to ring buffer (max %.1fMB)\n", 
-      RING_BUFFER_SIZE / (1024.0f * 1024.0f));
+  // Quick initial buffer fill (16KB minimum for smoothness)
+  while(stream->connected() && ringBuf.available() < MIN_STREAM_BUFFER){
+    int avail = stream->available();
+    size_t ringSpace = ringBuf.space();
     
-    while(stream->connected() && !downloadComplete){
-      int avail = stream->available();
-      size_t ringSpace = ringBuf.space();
+    if(avail > 0 && ringSpace > 0){
+      int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
+      if(toRead > (int)ringSpace) toRead = (int)ringSpace;
       
-      if(avail > 0 && ringSpace > 0){
-        int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
-        if(toRead > (int)ringSpace) toRead = (int)ringSpace;
-        
-        int r = stream->readBytes(httpReadBuf, toRead);
-        if(r > 0){
-          size_t written = ringBuf.write(httpReadBuf, r);
-          statsTotalHttp += written;
-          statsWindowHttp += written;
-          httpBytesDownloadedMono += written;
-          httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
-          totalDownloaded += written;
-        }
-      } else if(avail <= 0 && !stream->connected()){
-        if(expectedTotalBytes > 0){
-          size_t headerSize = pcmStart;
-          size_t expectedDataBytes = expectedTotalBytes > headerSize ? (expectedTotalBytes - headerSize) : expectedTotalBytes;
-          if(httpBytesDownloadedMono >= expectedDataBytes || 
-             (expectedDataBytes - httpBytesDownloadedMono) < 4096){
-            downloadComplete = true;
-          }
-        } else {
-          delay(1000);
-          if(!stream->connected() && stream->available() == 0){
-            downloadComplete = true;
-          }
-        }
+      int r = stream->readBytes(httpReadBuf, toRead);
+      if(r > 0){
+        size_t written = ringBuf.write(httpReadBuf, r);
+        statsTotalHttp += written;
+        statsWindowHttp += written;
+        httpBytesDownloadedMono += written;
+        httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
       }
-      
-      if(mqttClient.connected() && (millis() % 200 < 10)){
-        mqttClient.loop();
-      }
+    } else {
       delay(1);
     }
     
-    Serial.printf("[PLAY][DOWNLOAD] Small file download complete: %.1fkB in %.2fs\n",
-      totalDownloaded / 1024.0f, (millis() - downloadStart) / 1000.0f);
-  } else {
-    // Large file: Download 256KB initial buffer, then start playback while continuing download
-    Serial.printf("[PLAY][DOWNLOAD] Large file - downloading initial buffer (%.1fkB)\n",
-      INITIAL_BUFFER_SIZE / 1024.0f);
-    
-    while(stream->connected() && ringBuf.available() < INITIAL_BUFFER_SIZE){
-      int avail = stream->available();
-      size_t ringSpace = ringBuf.space();
-      
-      if(avail > 0 && ringSpace > 0){
-        int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
-        if(toRead > (int)ringSpace) toRead = (int)ringSpace;
-        
-        int r = stream->readBytes(httpReadBuf, toRead);
-        if(r > 0){
-          size_t written = ringBuf.write(httpReadBuf, r);
-          statsTotalHttp += written;
-          statsWindowHttp += written;
-          httpBytesDownloadedMono += written;
-          httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
-          totalDownloaded += written;
-        }
-      }
-      
-      if(mqttClient.connected() && (millis() % 200 < 10)){
-        mqttClient.loop();
-      }
-      delay(1);
+    if(mqttClient.connected() && (millis() % 200 < 10)){
+      mqttClient.loop();
     }
-    
-    Serial.printf("[PLAY][DOWNLOAD] Initial buffer ready: %.1fkB in %.2fs - starting playback\n",
-      ringBuf.available() / 1024.0f, (millis() - downloadStart) / 1000.0f);
   }
+  
+  Serial.printf("[PLAY][STREAM] Initial buffer ready: %.1fkB - starting direct streaming\n",
+    ringBuf.available() / 1024.0f);
   
   if(ringBuf.available() == 0){
     Serial.println("[PLAY] ERROR: Ring buffer is empty!");
@@ -878,13 +827,6 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     uninstallI2STX();
     return;
   }
-  
-  // ===== PHASE 2: STREAM FROM RING BUFFER TO I2S (with parallel download for large files) =====
-  Serial.printf("[PLAY][STREAM] Starting playback from ring buffer (%.1fkB)\n",
-    ringBuf.available() / 1024.0f);
-  
-  // DO NOT set ledState here - rainbow will start only when first I2S write succeeds
-  bool rainbowStarted = false;
   
   auto logPlaybackStats = [&](const char* phase, int streamAvailable = -1, bool isPaused = false, size_t ringBufFill = 0) {
     unsigned long now = millis();
@@ -935,25 +877,32 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     }
   };
 
-  // Main playback loop - stream from ring buffer to I2S (with parallel download for large files)
+  // ===== DIRECT STREAMING LOOP: Continuous download + playback =====
   bool playbackComplete = false;
   
   while(!playbackComplete){
     unsigned long now = millis();
     size_t ringBufferFill = ringBuf.available();
     
-    // ===== PARALLEL DOWNLOAD TASK (for large files only) =====
-    if(!isSmallFile && stream->connected() && !downloadComplete){
+    // ===== DOWNLOAD TASK: Continuously read from HTTP and feed ring buffer =====
+    // Priority: Download has highest priority to prevent buffer underrun
+    if(stream->connected() && !downloadComplete){
       int avail = stream->available();
       size_t ringSpace = ringBuf.space();
       
-      // Priority: Always try to download when data is available
-      // This ensures continuous download to prevent buffer underrun
+      // Aggressive download: Always try to download when data is available
       if(avail > 0 && ringSpace > 0){
+        // Read as much as possible (up to READ_BUF or available space)
         int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
         if(toRead > (int)ringSpace) toRead = (int)ringSpace;
         
-        // Read aggressively to maintain buffer level
+        // If buffer is low, try to read even more aggressively
+        if(ringBufferFill < LOW_BUFFER_THRESHOLD && avail > toRead){
+          int maxRead = (int)READ_BUF * 2; // Can read up to 2x READ_BUF
+          if(maxRead > (int)ringSpace) maxRead = (int)ringSpace;
+          if(maxRead > toRead && avail >= maxRead) toRead = maxRead;
+        }
+        
         int r = stream->readBytes(httpReadBuf, toRead);
         if(r > 0){
           size_t written = ringBuf.write(httpReadBuf, r);
@@ -961,7 +910,6 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
           statsWindowHttp += written;
           httpBytesDownloadedMono += written;
           httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
-          totalDownloaded += written;
         }
       } else if(avail <= 0 && !stream->connected()){
         // Check if download is complete
@@ -971,48 +919,64 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
           if(httpBytesDownloadedMono >= expectedDataBytes || 
              (expectedDataBytes - httpBytesDownloadedMono) < 4096){
             downloadComplete = true;
-            Serial.printf("[PLAY][DOWNLOAD] Parallel download complete: %.1fkB total\n",
+            Serial.printf("[PLAY][STREAM] Download complete: %.1fkB total\n",
               httpBytesDownloadedMono / 1024.0f);
           }
         } else {
+          // No Content-Length - wait a bit and check
           delay(500);
           if(!stream->connected() && stream->available() == 0){
             downloadComplete = true;
+            Serial.println("[PLAY][STREAM] Stream disconnected - download complete");
           }
         }
       }
-    } else if(isSmallFile){
-      downloadComplete = true; // Small file already fully downloaded
     }
     
     // ===== PLAYBACK TASK: Read from ring buffer and feed I2S =====
-    // For large files: Ensure minimum buffer before playing to prevent breaking
-    if(!isSmallFile && ringBufferFill < (INITIAL_BUFFER_SIZE / 4) && !downloadComplete){
-      // Buffer too low during parallel download - wait for more data
-      delay(5);
+    // Adaptive playback: Pause if buffer too low, resume when sufficient
+    static bool playbackPaused = false;
+    
+    if(ringBufferFill < LOW_BUFFER_THRESHOLD && !downloadComplete){
+      // Buffer too low - pause playback and wait for more data
+      if(!playbackPaused){
+        playbackPaused = true;
+        Serial.printf("[PLAY][PAUSE] Buffer low: %.1fkB < %.1fkB - pausing to fill buffer\n",
+          ringBufferFill / 1024.0f, LOW_BUFFER_THRESHOLD / 1024.0f);
+      }
+      delay(5); // Wait for download to fill buffer
       continue;
+    } else if(playbackPaused && ringBufferFill >= RESUME_BUFFER_THRESHOLD){
+      // Buffer sufficient - resume playback
+      playbackPaused = false;
+      Serial.printf("[PLAY][RESUME] Buffer sufficient: %.1fkB >= %.1fkB - resuming playback\n",
+        ringBufferFill / 1024.0f, RESUME_BUFFER_THRESHOLD / 1024.0f);
     }
     
     if(ringBufferFill == 0){
       // No data available - check if we're done
       if(downloadComplete){
         playbackComplete = true;
-        Serial.printf("[PLAY][STREAM] Playback complete - all data played from ring buffer\n");
+        Serial.printf("[PLAY][STREAM] Playback complete - all data played\n");
         break;
       } else {
-        // Still downloading, wait a bit (but not too long to avoid breaking)
+        // Still downloading, wait a bit
         delay(5);
         continue;
       }
     }
     
     // Read available data from ring buffer (up to READ_BUF)
-    // Ensure we don't read too much at once to maintain smooth flow
-    size_t toPlay = (ringBufferFill < READ_BUF) ? ringBufferFill : READ_BUF;
-    // For large files, read smaller chunks to maintain buffer level
-    if(!isSmallFile && ringBufferFill < (INITIAL_BUFFER_SIZE / 2)){
-      toPlay = (toPlay < (READ_BUF / 2)) ? toPlay : (READ_BUF / 2);
+    // Adaptive read size: Read more when buffer is healthy, less when low
+    size_t toPlay = READ_BUF;
+    if(ringBufferFill < RESUME_BUFFER_THRESHOLD){
+      // Buffer is low - read smaller chunks to maintain level
+      toPlay = (ringBufferFill < (READ_BUF / 2)) ? ringBufferFill : (READ_BUF / 2);
+    } else if(ringBufferFill < READ_BUF){
+      // Buffer less than READ_BUF - read what's available
+      toPlay = ringBufferFill;
     }
+    
     size_t readFromRing = ringBuf.read(playbackBuf, toPlay);
       
       if(readFromRing > 0){
@@ -1024,6 +988,15 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
           size_t samples = readFromRing / 2;
           if(samples > 0){
             size_t outBytes = samples * 4;
+            // Safety check: Ensure we don't exceed pre-allocated buffer size
+            if(outBytes > stereoScratch.cap){
+              Serial.printf("[PLAY] ERROR: outBytes (%u) > pre-allocated buffer (%u) - clamping\n",
+                (unsigned)outBytes, (unsigned)stereoScratch.cap);
+              outBytes = stereoScratch.cap;
+              samples = outBytes / 4;
+              readFromRing = samples * 2; // Adjust readFromRing to match
+            }
+            // Ensure buffer is ready (should always succeed since pre-allocated)
             if(!stereoScratch.ensure(outBytes)){
               Serial.println("[PLAY] stereo buffer alloc failed");
               okWrite = false;
@@ -1106,10 +1079,10 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     }
     
     // Log stats periodically
-    logPlaybackStats("playback", stream->available(), false, ringBufferFill);
+    logPlaybackStats("playback", stream->available(), playbackPaused, ringBufferFill);
     
-    // Update rainbow LED only if playback has started
-    if(rainbowStarted){
+    // Update rainbow LED only if playback has started and not paused
+    if(rainbowStarted && !playbackPaused){
       ledRainbowStepFast();
     }
     
@@ -1421,7 +1394,7 @@ void loop(){
       }
       break;
     case LS_RANDOM_RGB:
-      // Random RGB (handled above in priority 5)
+      // Handled above
       break;
     case LS_DISCONNECTED:
       ledFill(0,0,255); // Blue - WiFi disconnected
@@ -1437,3 +1410,6 @@ void loop(){
   if(mqttClient.connected()) lastActivityMs = now;
   delay(4);
 }
+
+
+
