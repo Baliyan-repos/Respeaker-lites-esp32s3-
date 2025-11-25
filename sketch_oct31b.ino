@@ -1437,5 +1437,3 @@ void loop(){
   if(mqttClient.connected()) lastActivityMs = now;
   delay(4);
 }
-
-
