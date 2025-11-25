@@ -51,9 +51,11 @@ static const unsigned long POSTROLL_MS = 200UL;
 // Playback robustness - Real-time streaming mode (event-driven)
 static const size_t PLAY_READ_BUF = 4 * 1024;       // 4KB read buffer
 static const size_t RING_BUFFER_SIZE = 64 * 1024;   // 64KB ring buffer for real-time streaming
-static const size_t MIN_STREAM_BUFFER = 12 * 1024;   // 12KB minimum buffer before starting playback (more stable start)
-static const size_t LOW_BUFFER_THRESHOLD = 10 * 1024; // 10KB - if below this, pause playback and fill buffer
-static const size_t RESUME_BUFFER_THRESHOLD = 18 * 1024; // 18KB - resume playback when buffer reaches this (achievable threshold)
+static const size_t MIN_STREAM_BUFFER = 20 * 1024;   // 20KB minimum buffer before starting playback (larger initial buffer for stability)
+static const size_t LOW_BUFFER_THRESHOLD = 3 * 1024; // 3KB - if below this, pause playback and fill buffer (very low threshold)
+static const size_t RESUME_BUFFER_THRESHOLD = 20 * 1024; // 20KB - resume playback when buffer reaches this (large gap prevents oscillation)
+static const size_t CRITICAL_ZONE = 24 * 1024; // 24KB - above this, buffer is safe, read full chunks
+static const size_t STABLE_ZONE = 18 * 1024; // 18KB - between 18-24KB, read medium chunks
 static const unsigned long PLAY_STATS_INTERVAL_MS = 1000UL;
 
 // Audio filters
@@ -936,21 +938,37 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     // ===== PLAYBACK TASK: Read from ring buffer and feed I2S =====
     // Adaptive playback: Pause if buffer too low, resume when sufficient
     static bool playbackPaused = false;
+    static unsigned long lastResumeTime = 0;
+    static const unsigned long RESUME_GRACE_PERIOD_MS = 1000UL; // 1 second grace period after resume
     
-    if(ringBufferFill < LOW_BUFFER_THRESHOLD && !downloadComplete){
-      // Buffer too low - pause playback and wait for more data
+    // Pause if buffer too low (only if not already paused to avoid spam)
+    // Add grace period: don't pause immediately after resume
+    unsigned long timeSinceResume = millis() - lastResumeTime;
+    bool inGracePeriod = timeSinceResume < RESUME_GRACE_PERIOD_MS;
+    
+    if(ringBufferFill < LOW_BUFFER_THRESHOLD && !downloadComplete && !inGracePeriod){
       if(!playbackPaused){
         playbackPaused = true;
         Serial.printf("[PLAY][PAUSE] Buffer low: %.1fkB < %.1fkB - pausing to fill buffer\n",
           ringBufferFill / 1024.0f, LOW_BUFFER_THRESHOLD / 1024.0f);
       }
-      delay(5); // Wait for download to fill buffer
+      // Skip playback, let download fill buffer
+      delay(20); // Give download more time to fill
       continue;
-    } else if(playbackPaused && ringBufferFill >= RESUME_BUFFER_THRESHOLD){
-      // Buffer sufficient - resume playback
+    }
+    
+    // Resume if buffer sufficient
+    if(playbackPaused && ringBufferFill >= RESUME_BUFFER_THRESHOLD){
       playbackPaused = false;
+      lastResumeTime = millis();
       Serial.printf("[PLAY][RESUME] Buffer sufficient: %.1fkB >= %.1fkB - resuming playback\n",
         ringBufferFill / 1024.0f, RESUME_BUFFER_THRESHOLD / 1024.0f);
+    }
+    
+    // If paused, skip playback
+    if(playbackPaused){
+      delay(10);
+      continue;
     }
     
     if(ringBufferFill == 0){
@@ -967,14 +985,31 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     }
     
     // Read available data from ring buffer (up to READ_BUF)
-    // Adaptive read size: Read more when buffer is healthy, less when low
+    // Multi-zone adaptive read size: Read smaller chunks when buffer is low to prevent rapid consumption
     size_t toPlay = READ_BUF;
-    if(ringBufferFill < RESUME_BUFFER_THRESHOLD){
-      // Buffer is low - read smaller chunks to maintain level
-      toPlay = (ringBufferFill < (READ_BUF / 2)) ? ringBufferFill : (READ_BUF / 2);
-    } else if(ringBufferFill < READ_BUF){
-      // Buffer less than READ_BUF - read what's available
-      toPlay = ringBufferFill;
+    
+    // Zone-based adaptive reading for smooth playback
+    if(ringBufferFill >= CRITICAL_ZONE){
+      // Safe zone (>=24KB): Read full chunks (4KB) - buffer is healthy
+      toPlay = READ_BUF;
+    } else if(ringBufferFill >= STABLE_ZONE){
+      // Stable zone (18-24KB): Read medium chunks (2KB) - buffer is okay but not fully safe
+      toPlay = 2 * 1024;
+    } else if(ringBufferFill >= RESUME_BUFFER_THRESHOLD){
+      // Critical zone (20-18KB): Read small chunks (1KB) - just resumed, be careful
+      toPlay = 1 * 1024;
+    } else {
+      // Very low (below resume threshold but above pause): Read tiny chunks (512B) - emergency mode
+      toPlay = 512;
+    }
+    
+    // Safety: Don't read more than available
+    if(ringBufferFill < toPlay) toPlay = ringBufferFill;
+    
+    // Additional throttling: If just resumed (in grace period), read even smaller
+    if(inGracePeriod && toPlay > 512){
+      toPlay = 512; // Very conservative during grace period
+      if(ringBufferFill < toPlay) toPlay = ringBufferFill;
     }
     
     size_t readFromRing = ringBuf.read(playbackBuf, toPlay);
@@ -1068,8 +1103,23 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
           statsTotalI2S += monoEquivalentBytes;  // Track mono-equivalent bytes
           statsWindowI2S += monoEquivalentBytes;
           i2sChunkCount += ((monoEquivalentBytes + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
+          
+          // Adaptive throttling: Add small delay when buffer is in critical zones
+          // This gives download time to catch up
+          if(ringBufferFill < CRITICAL_ZONE){
+            if(ringBufferFill < STABLE_ZONE){
+              delay(3); // Critical zone: 3ms delay
+            } else {
+              delay(1); // Stable zone: 1ms delay
+            }
+          }
         }
       }
+    
+    // If we read small chunks (buffer low), add small delay to give download time
+    if(toPlay < (READ_BUF / 2)){
+      delay(2); // Small delay when reading small chunks
+    }
     
     // Check if playback is complete
     if(ringBuf.available() == 0 && downloadComplete){
@@ -1410,6 +1460,3 @@ void loop(){
   if(mqttClient.connected()) lastActivityMs = now;
   delay(4);
 }
-
-
-
