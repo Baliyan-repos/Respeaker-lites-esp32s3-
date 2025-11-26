@@ -1,5 +1,5 @@
 // esp32_respeaker_prod_final.ino
-// Production firmware (updated playback prebuffer + robustness)
+// Production firmware - Complete redesign with proper state management
 
 #include <Arduino.h>
 #include <WiFi.h>
@@ -38,24 +38,22 @@ static const unsigned long MQTT_RECONNECT_MS = 2000UL;
 static const size_t MQTT_BUF_SIZE = 16384;
 
 // -------- WIFI MANAGER --------
-WiFiManager wm; // use one global instance
-static const char* AP_SSID = "Rannkly Nova Speaker"; // Open portal as requested
+WiFiManager wm;
+static const char* AP_SSID = "Rannkly Nova Speaker"; // AP hotspot name - no password
 
 // -------- AUDIO CAPTURE --------
 static const uint32_t SAMPLE_RATE = 16000u;
-static const int EXTRACTION_SHIFT = 8;           // 24-bit MSB aligned in 32b -> >>8
+static const int EXTRACTION_SHIFT = 8;
 static const size_t I2S_READ_BYTES = 8192;
 static const unsigned long RECORD_TIMEOUT_MS = 8000UL; // 8 seconds
 static const unsigned long POSTROLL_MS = 200UL;
 
-// Playback robustness - Real-time streaming mode (event-driven)
-static const size_t PLAY_READ_BUF = 4 * 1024;       // 4KB read buffer
-static const size_t RING_BUFFER_SIZE = 64 * 1024;   // 64KB ring buffer for real-time streaming
-static const size_t MIN_STREAM_BUFFER = 20 * 1024;   // 20KB minimum buffer before starting playback (larger initial buffer for stability)
-static const size_t LOW_BUFFER_THRESHOLD = 3 * 1024; // 3KB - if below this, pause playback and fill buffer (very low threshold)
-static const size_t RESUME_BUFFER_THRESHOLD = 20 * 1024; // 20KB - resume playback when buffer reaches this (large gap prevents oscillation)
-static const size_t CRITICAL_ZONE = 24 * 1024; // 24KB - above this, buffer is safe, read full chunks
-static const size_t STABLE_ZONE = 18 * 1024; // 18KB - between 18-24KB, read medium chunks
+// Playback robustness - Adaptive streaming with 712KB ring buffer
+static const size_t PLAY_READ_BUF = 8 * 1024; // Increased from 4KB to 8KB for faster download
+static const size_t RING_BUFFER_SIZE = 712 * 1024; // 712KB ring buffer
+static const size_t INITIAL_BUFFER_TARGET = 512 * 1024;
+static const size_t LOW_BUFFER_THRESHOLD = 32 * 1024;
+static const size_t RESUME_BUFFER_THRESHOLD = 128 * 1024;
 static const unsigned long PLAY_STATS_INTERVAL_MS = 1000UL;
 
 // Audio filters
@@ -66,14 +64,6 @@ struct Biquad {
     float y = b0*x + b1*x1 + b2*x2 - a1*y1 - a2*y2;
     x2=x1; x1=x; y2=y1; y1=y;
     return y;
-  }
-  static Biquad makeNotch(float fs, float f0, float Q){
-    float w0 = 2.0f * M_PI * f0 / fs;
-    float alpha = sinf(w0)/(2.0f * Q);
-    float cosw0 = cosf(w0);
-    float b0=1, b1=-2*cosw0, b2=1;
-    float a0=1+alpha, a1=-2*cosw0, a2=1-alpha;
-    Biquad q; q.b0=b0/a0; q.b1=b1/a0; q.b2=b2/a0; q.a1=a1/a0; q.a2=a2/a0; return q;
   }
   static Biquad makeHPF(float fs, float fc, float Q=0.707f){
     float w0 = 2.0f * M_PI * fc / fs;
@@ -95,7 +85,6 @@ struct Biquad {
 struct VoiceFilterChain {
   Biquad hpf, lpf;
   void init(float fs){
-    // Keep processing minimal: gentle HPF and LPF only
     hpf  = Biquad::makeHPF(fs, 110.0f, 0.707f);
     lpf  = Biquad::makeLPF(fs, 4200.0f, 0.707f);
   }
@@ -107,10 +96,10 @@ struct VoiceFilterChain {
 } g_voice;
 struct SmoothNoiseGate {
   float noiseFloor = 80.0f;
-  float targetSNR = 4.0f;       // dB (gentler open threshold)
-  float attack = 0.08f;         // s
-  float release = 0.80f;        // s (longer close to avoid chattering)
-  float g = 0.0f;               // 0..1
+  float targetSNR = 4.0f;
+  float attack = 0.08f;
+  float release = 0.80f;
+  float g = 0.0f;
   void reset(){ g = 0.0f; }
   inline float step(float rms, float fs, size_t n){
     float alphaNoise = 1.0f - expf(-(float)n / (fs * 1.5f));
@@ -131,13 +120,9 @@ struct SmoothNoiseGate {
   }
 } g_gate;
 
-// Normalization
-static const float NORMALIZE_TARGET_PEAK = 20000.0f;
-static const float MAX_DIGITAL_GAIN      = 6.0f;
-
 // -------- CHUNK UPLOAD --------
-static const size_t CHUNK_PUBLISH_SIZE = 8192;
-static const unsigned long CHUNK_PUBLISH_DELAY_MS = 20UL;
+static const size_t CHUNK_PUBLISH_SIZE = 16384; // Increased from 8192 to 16384 for faster streaming
+static const unsigned long CHUNK_PUBLISH_DELAY_MS = 5UL; // Reduced from 20ms to 5ms for faster streaming
 static const char* SESSION_COUNTER_PATH = "/session_counter";
 
 // -------- BUTTON / UX --------
@@ -155,12 +140,14 @@ Adafruit_NeoPixel pixels(LED_COUNT, LED_PIN, NEO_GRB + NEO_KHZ800);
 volatile bool recorderInstalled = false;
 volatile bool playbackActive = false;
 volatile bool isRecording = false;
+volatile bool isStreaming = false;
+static bool i2sTxInstalled = false;
 unsigned long sessionCounter = 0;
 unsigned long lastMQTTAttempt = 0;
 unsigned long lastActivityMs = 0;
-String lastPlayedUrl = ""; // Track last played URL to prevent auto-replay
-unsigned long lastPlaybackEndTime = 0; // Track when playback ended
-const unsigned long PLAYBACK_COOLDOWN_MS = 2000; // 2 second cooldown after playback ends
+String lastPlayedUrl = "";
+unsigned long lastPlaybackEndTime = 0;
+const unsigned long PLAYBACK_COOLDOWN_MS = 2000;
 
 // Button FSM
 enum BtnPhase { BP_IDLE=0, BP_DEBOUNCE, BP_PRESSED };
@@ -175,45 +162,52 @@ unsigned long idleAnimTick = 0;
 uint16_t rainbowPos = 0;
 unsigned long lastRandomRgbChange = 0;
 
-// Topics
 String TOP_PLAY_CTRL;
 
 // -------- LED helpers --------
-void ledInit(){ pixels.begin(); pixels.setBrightness(120); pixels.show(); }
+void ledInit(){ pixels.begin(); pixels.setBrightness(200); pixels.show(); } // Increased from 120 to 200
 void ledFill(uint8_t r, uint8_t g, uint8_t b){
   for(int i=0;i<LED_COUNT;i++) pixels.setPixelColor(i, pixels.Color(r,g,b));
   pixels.show();
 }
 void ledRainbowStepFast(){
-  static unsigned long lastRainbowUpdate = 0;
+  static unsigned long lastRainbowStep = 0;
   unsigned long now = millis();
-  // Update rainbow every 20ms (like reference firmware) for smooth but fast animation
-  if(now - lastRainbowUpdate < 20) return;
-  lastRainbowUpdate = now;
-  
-  rainbowPos++; // Increment by 1 (not 2) for smoother animation
+  const unsigned long PLAY_RAINBOW_MS = 2; // Very fast rainbow (2ms) for streaming - faster than before
+  if(now - lastRainbowStep < PLAY_RAINBOW_MS) return;
+  lastRainbowStep = now;
+  rainbowPos += 6; // Increment by 6 for faster and more colorful transitions
   for(int i=0;i<LED_COUNT;i++){
-    uint8_t idx = (i * 256 / max(1,LED_COUNT) + rainbowPos) & 0xFF;
-    pixels.setPixelColor(i, pixels.ColorHSV(idx * 256));
+    // Enhanced rainbow with more colors - full 360 degree hue range
+    uint16_t hue = ((i * 360 / max(1,LED_COUNT) + rainbowPos) % 360);
+    // Use full saturation and value for vibrant colors
+    uint32_t color = pixels.ColorHSV(hue * 65536 / 360, 255, 255);
+    pixels.setPixelColor(i, color);
   }
-  pixels.setBrightness(120);
+  pixels.setBrightness(220); // Increased from 150 to 220
   pixels.show();
 }
 void ledIdleAmbientStep(){
-  static uint16_t base = 0;
-  base++;
+  static unsigned long lastIdleAnimUpdate = 0;
+  unsigned long now = millis();
+  const unsigned long IDLE_ANIM_STEP_MS = 80; // Slow ambient (80ms)
+  if(now - lastIdleAnimUpdate < IDLE_ANIM_STEP_MS) return;
+  lastIdleAnimUpdate = now;
+  static uint16_t hueBase = 0;
+  hueBase++;
   for(int i=0;i<LED_COUNT;i++){
-    uint16_t hue = (base + i*12) % 360;
-    pixels.setPixelColor(i, pixels.ColorHSV(hue * 182));
+    uint16_t hue = (hueBase + i*12) % 360;
+    uint32_t col = pixels.ColorHSV(hue * 182);
+    pixels.setPixelColor(i, col);
   }
-  pixels.setBrightness(80);
+  pixels.setBrightness(180); // Increased from 90 to 180
   pixels.show();
 }
 void ledRandomRgb(){
   static uint8_t r = 0, g = 0, b = 0;
   static unsigned long lastChange = 0;
   unsigned long now = millis();
-  if(now - lastChange > 500){ // Change every 500ms
+  if(now - lastChange > 500){
     r = (uint8_t)(esp_random() % 256);
     g = (uint8_t)(esp_random() % 256);
     b = (uint8_t)(esp_random() % 256);
@@ -225,16 +219,6 @@ void ledRandomRgb(){
 // -------- FS helpers --------
 bool ensureLittleFS(){
   if(!LittleFS.begin(true)){ Serial.println("[FS] mount fail"); return false; }
-  
-  // Print LittleFS size information
-  size_t totalBytes = LittleFS.totalBytes();
-  size_t usedBytes = LittleFS.usedBytes();
-  size_t freeBytes = totalBytes - usedBytes;
-  Serial.printf("[FS] LittleFS: total=%u bytes (%.2f MB), used=%u bytes (%.2f MB), free=%u bytes (%.2f MB)\n",
-    (unsigned)totalBytes, totalBytes / (1024.0f * 1024.0f),
-    (unsigned)usedBytes, usedBytes / (1024.0f * 1024.0f),
-    (unsigned)freeBytes, freeBytes / (1024.0f * 1024.0f));
-  
   if(LittleFS.exists(SESSION_COUNTER_PATH)){
     File f = LittleFS.open(SESSION_COUNTER_PATH, FILE_READ);
     if(f){ sessionCounter = (unsigned long)f.parseInt(); f.close(); }
@@ -280,17 +264,25 @@ void setupI2SRecorder(){
 }
 void uninstallI2SRecorder(){
   if(!recorderInstalled) return;
-  i2s_driver_uninstall(I2S_NUM_0);
-  recorderInstalled = false;
+  i2s_stop(I2S_NUM_0);
+  esp_err_t uninstallResult = i2s_driver_uninstall(I2S_NUM_0);
+  if(uninstallResult == ESP_OK || uninstallResult == ESP_ERR_INVALID_STATE){
+    recorderInstalled = false;
+    delay(10);
+  }
   pinMode(I2S_BCK, INPUT); pinMode(I2S_WS, INPUT); pinMode(I2S_DATA_IN, INPUT);
-  delay(10);
 }
 
 // -------- I2S playback (TX) --------
 bool installI2STX(uint32_t sampleRate){
-  // Uninstall existing driver first with proper cleanup
-  if(i2s_driver_uninstall(I2S_NUM_1) == ESP_OK){
-    delay(50); // Allow driver to fully uninstall
+  // Safe uninstall with proper checks
+  if(i2sTxInstalled){
+    i2s_stop(I2S_NUM_1);
+    esp_err_t uninstallResult = i2s_driver_uninstall(I2S_NUM_1);
+    if(uninstallResult == ESP_OK || uninstallResult == ESP_ERR_INVALID_STATE){
+      delay(50);
+    }
+    i2sTxInstalled = false;
   }
   
   i2s_config_t cfg = {
@@ -299,9 +291,9 @@ bool installI2STX(uint32_t sampleRate){
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_RIGHT_LEFT,
     .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1, // Use interrupt flag for better performance
-    .dma_buf_count = 16,  // Increased from 10 for smoother streaming
-    .dma_buf_len = 512,   // Reduced from 1024 for lower latency
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 16,
+    .dma_buf_len = 512,
     .use_apll = false,
     .tx_desc_auto_clear = true,
     .fixed_mclk = 0
@@ -327,15 +319,20 @@ bool installI2STX(uint32_t sampleRate){
   }
   
   i2s_zero_dma_buffer(I2S_NUM_1);
-  delay(10); // Small delay to ensure I2S is ready
-  Serial.printf("[I2S] TX ready @%u Hz (DMA: %d buffers x %d bytes)\n", 
-    (unsigned)sampleRate, cfg.dma_buf_count, cfg.dma_buf_len);
+  delay(10);
+  i2sTxInstalled = true;
+  Serial.printf("[I2S] TX ready @%u Hz\n", (unsigned)sampleRate);
   return true;
 }
 void uninstallI2STX(){
-  i2s_stop(I2S_NUM_1); // Stop I2S before uninstalling
-  i2s_driver_uninstall(I2S_NUM_1);
-  delay(20); // Allow time for cleanup
+  if(i2sTxInstalled){
+    i2s_stop(I2S_NUM_1);
+    esp_err_t uninstallResult = i2s_driver_uninstall(I2S_NUM_1);
+    if(uninstallResult == ESP_OK || uninstallResult == ESP_ERR_INVALID_STATE){
+      delay(20);
+    }
+    i2sTxInstalled = false;
+  }
   pinMode(I2S_BCK, INPUT); pinMode(I2S_WS, INPUT); pinMode(I2S_DOUT, INPUT);
 }
 
@@ -362,7 +359,7 @@ bool connectMQTT(){
   return false;
 }
 
-// -------- Recording helpers (unchanged) --------
+// -------- Recording helpers --------
 String makeSessionPath(const char* sid){ String fn="/session_"; fn+=sid; fn+=".pcm"; return fn; }
 static inline int16_t processStereoToMonoS16(int32_t left32, int32_t right32){
   int64_t avg = ((int64_t)left32 + (int64_t)right32) / 2;
@@ -385,20 +382,23 @@ bool publishChunkWithRetries(const char* sid, uint32_t seq, const uint8_t* data,
   memcpy(buf+4, data, len);
   String top = String(DEVICE_ID) + "/audio/" + sid + "/chunk";
   bool ok=false;
-  for(int attempt=0; attempt<6; attempt++){
+  // Reduced retry attempts and delays for faster streaming
+  for(int attempt=0; attempt<4; attempt++){ // Reduced from 6 to 4 attempts
     if(!mqttClient.connected()){
       connectMQTT();
       unsigned long t0 = millis();
-      while(!mqttClient.connected() && millis() - t0 < 1500){ mqttClient.loop(); delay(20); }
+      while(!mqttClient.connected() && millis() - t0 < 1000){ // Reduced from 1500ms to 1000ms
+        mqttClient.loop(); 
+        delay(10); // Reduced from 20ms to 10ms
+      }
     }
     if(mqttClient.connected()){
       ok = mqttClient.publish(top.c_str(), buf, (unsigned int)total, false);
       if(ok) break;
     }
-    delay(150);
+    delay(50); // Reduced from 150ms to 50ms for faster retries
   }
   free(buf);
-  if(!ok) Serial.printf("[MQTT] publish chunk seq=%u failed\n", (unsigned)seq);
   return ok;
 }
 void publishControlStart(const char* sid, uint32_t totalChunks, uint32_t chunkBytes){
@@ -420,14 +420,17 @@ void publishControlFinal(const char* sid, uint32_t totalChunks){
 void recordTimedToFile(const char* sid, uint32_t timeoutMs){
   String fn = makeSessionPath(sid);
   if(LittleFS.exists(fn)) LittleFS.remove(fn);
-  { File f = LittleFS.open(fn, FILE_WRITE); if(!f){ Serial.printf("[FS] cannot create %s\n", fn.c_str()); return; } }
+  { File f = LittleFS.open(fn, FILE_WRITE); if(!f){ return; } }
 
   uint8_t *i2sBuf = (uint8_t*)malloc(I2S_READ_BYTES);
-  if(!i2sBuf){ Serial.println("[ALLOC] i2sBuf failed"); return; }
+  if(!i2sBuf){ return; }
   size_t bytesRead = 0;
   unsigned long tStop = millis() + timeoutMs;
-  Serial.printf("[REC] session %s -> %s (timeout %ums)\n", sid, fn.c_str(), (unsigned)timeoutMs);
-  ledState = LS_RECORDING; ledFill(0,0,255);
+  
+  isRecording = true;
+  ledState = LS_RECORDING;
+  ledFill(0,0,255); // Blue light during recording
+  lastActivityMs = millis();
   g_gate.reset();
 
   while(millis() < tStop){
@@ -437,14 +440,13 @@ void recordTimedToFile(const char* sid, uint32_t timeoutMs){
       if(stereoFrames == 0) continue;
       size_t outBytes = stereoFrames * 2;
       int16_t *out = (int16_t*)malloc(outBytes);
-      if(!out){ Serial.println("[ALLOC] out fail"); break; }
+      if(!out){ break; }
       int32_t *s32 = (int32_t*)i2sBuf;
       for(size_t i=0;i<stereoFrames;i++){
         int32_t l32 = s32[2*i + 1];
         int32_t r32 = s32[2*i + 0];
         out[i] = processStereoToMonoS16(l32, r32);
       }
-      // chunk RMS for adaptive gating
       double acc=0.0; for(size_t i=0;i<stereoFrames;i++){ double v=out[i]; acc+=v*v; }
       float rms = stereoFrames ? sqrtf(acc/(float)stereoFrames) : 0.0f;
       float gate = g_gate.step(rms, (float)SAMPLE_RATE, stereoFrames);
@@ -457,54 +459,34 @@ void recordTimedToFile(const char* sid, uint32_t timeoutMs){
         }
       }
       File fw = LittleFS.open(fn, FILE_APPEND);
-      if(fw){ fw.write((uint8_t*)out, outBytes); fw.close(); } else { Serial.println("[FS] append open fail"); }
+      if(fw){ fw.write((uint8_t*)out, outBytes); fw.close(); }
       free(out);
       lastActivityMs = millis();
     } else if(r != ESP_OK){
-      Serial.printf("[I2S] read err %d\n", (int)r);
       delay(5);
     }
     if(mqttClient.connected()) mqttClient.loop();
   }
   free(i2sBuf);
-  isRecording = false;
   Serial.println("[REC] saved");
   unsigned long pr = millis();
   while(millis() - pr < POSTROLL_MS){ if(mqttClient.connected()) mqttClient.loop(); delay(5); }
 }
 
-// Analyze to compute normalization gain (peak)
-bool analyzeFilePeak(const char* path, int32_t &outPeak){
-  File f = LittleFS.open(path, FILE_READ);
-  if(!f) return false;
-  int32_t peak = 1;
-  const size_t BUF=4096; int16_t *buf=(int16_t*)malloc(BUF);
-  if(!buf){ f.close(); return false; }
-  while(true){
-    size_t r = f.read((uint8_t*)buf, BUF);
-    if(r==0) break;
-    size_t n = r/2;
-    for(size_t i=0;i<n;i++){ int32_t v=abs((int32_t)buf[i]); if(v>peak) peak=v; }
-  }
-  free(buf); f.close();
-  outPeak = peak<1?1:peak;
-  return true;
-}
-
 void streamSessionFileToMQTT(const char* sid){
   String fn = makeSessionPath(sid);
-  if(!LittleFS.exists(fn)){ Serial.printf("[FS] missing %s\n", fn.c_str()); return; }
+  if(!LittleFS.exists(fn)){ Serial.printf("[FS] missing %s\n", fn.c_str()); isRecording = false; return; }
   File f = LittleFS.open(fn, FILE_READ);
-  if(!f){ Serial.printf("[FS] open fail %s\n", fn.c_str()); return; }
+  if(!f){ Serial.printf("[FS] open fail %s\n", fn.c_str()); isRecording = false; return; }
   size_t fileLen = f.size();
-  if(fileLen == 0){ f.close(); Serial.println("[FS] empty"); return; }
+  if(fileLen == 0){ f.close(); Serial.println("[FS] empty"); isRecording = false; return; }
 
   uint32_t chunkBytes = (uint32_t)CHUNK_PUBLISH_SIZE;
   uint32_t totalChunks = (fileLen + chunkBytes - 1) / chunkBytes;
 
   unsigned long startTry = millis();
   while(!mqttClient.connected()){
-    if(millis() - startTry > 10000){ Serial.println("[MQTT] cannot connect - abort stream"); f.close(); return; }
+    if(millis() - startTry > 10000){ f.close(); isRecording = false; return; }
     if(millis() - lastMQTTAttempt > MQTT_RECONNECT_MS){ lastMQTTAttempt = millis(); connectMQTT(); }
     mqttClient.loop(); delay(200);
   }
@@ -512,30 +494,62 @@ void streamSessionFileToMQTT(const char* sid){
   delay(10);
 
   uint8_t *readBuf = (uint8_t*)malloc(chunkBytes);
-  if(!readBuf){ Serial.println("[ALLOC] readBuf fail"); f.close(); return; }
+  if(!readBuf){ f.close(); isRecording = false; return; }
+  isStreaming = true; // Button disabled during streaming
   ledState = LS_STREAMING;
+  lastActivityMs = millis();
+  // Start rainbow immediately when streaming begins
+  ledRainbowStepFast();
 
   uint32_t seq=0;
   while(f.available()){
     size_t toRead = f.read(readBuf, chunkBytes);
     if(toRead==0) break;
     publishChunkWithRetries(sid, seq++, readBuf, toRead);
+    
+    // Minimal delay - just enough for MQTT to process, update rainbow during this time
     unsigned long t0 = millis();
-    while(millis() - t0 < CHUNK_PUBLISH_DELAY_MS){ if(mqttClient.connected()) mqttClient.loop(); delay(1); }
-    ledRainbowStepFast();
+    while(millis() - t0 < CHUNK_PUBLISH_DELAY_MS){ 
+      if(mqttClient.connected()) mqttClient.loop(); 
+      // Update rainbow during minimal delay
+      if(isStreaming && ledState == LS_STREAMING){
+        ledRainbowStepFast();
+      }
+      delay(1); 
+    }
+    // Quick rainbow update and MQTT loop
+    if(mqttClient.connected()) mqttClient.loop();
+    if(isStreaming && ledState == LS_STREAMING){
+      ledRainbowStepFast();
+    }
+    lastActivityMs = millis();
   }
   free(readBuf); f.close();
   publishControlFinal(sid, seq);
-  unsigned long flush=millis(); while(millis()-flush<600){ mqttClient.loop(); delay(10); }
-  if(LittleFS.exists(fn)) { 
-    LittleFS.remove(fn); 
-    Serial.printf("[FS] removed %s\n", fn.c_str()); 
-  }
-  Serial.printf("[STREAM] session %s sent (%u chunks)\n", sid, (unsigned)seq);
-  // After streaming: Random RGB, then idle animation after 15s
-  ledState = LS_RANDOM_RGB;
+  Serial.printf("[UPLOAD] done sid=%s chunks=%u\n", sid, (unsigned)seq);
+  
+  // Stop rainbow IMMEDIATELY - set flags and state BEFORE any delay
+  isStreaming = false; // CRITICAL: Set flag FIRST to prevent any rainbow updates
+  ledState = LS_RANDOM_RGB; // CRITICAL: Change state immediately
   lastActivityMs = millis();
   lastRandomRgbChange = millis();
+  ledRandomRgb(); // CRITICAL: Update LEDs immediately to stop rainbow - NO delay before this
+  
+  // Flush MQTT messages (rainbow already stopped - isStreaming=false prevents any rainbow)
+  unsigned long flush=millis(); 
+  while(millis()-flush<100){ // Reduced to 100ms for faster completion
+    mqttClient.loop(); 
+    // NO rainbow updates here - isStreaming is false
+    delay(2); // Minimal delay
+  }
+  
+  if(LittleFS.exists(fn)) { 
+    LittleFS.remove(fn); 
+    Serial.printf("[FS] cleaned %s\n", fn.c_str());
+  }
+  
+  // Button enabled again
+  isRecording = false;
 }
 
 // -------- Ring Buffer for parallel download/playback --------
@@ -544,65 +558,162 @@ struct RingBuffer {
   size_t size;
   volatile size_t writePos;
   volatile size_t readPos;
-  volatile size_t availableBytes; // bytes available to read
+  volatile size_t availableBytes;
+  volatile bool initialized;
+  
+  RingBuffer() : data(nullptr), size(0), writePos(0), readPos(0), availableBytes(0), initialized(false) {}
   
   bool init(size_t sz) {
+    if(data) deinit(); // Clean up if already initialized
     data = (uint8_t*)malloc(sz);
-    if(!data) return false;
+    if(!data) {
+      initialized = false;
+      return false;
+    }
     size = sz;
     writePos = 0;
     readPos = 0;
     availableBytes = 0;
+    initialized = true;
     return true;
   }
   
   void deinit() {
-    if(data) { free(data); data = nullptr; }
+    initialized = false;
+    if(data) { 
+      free(data); 
+      data = nullptr; 
+    }
     size = 0;
     writePos = 0;
     readPos = 0;
     availableBytes = 0;
   }
   
-  size_t available() { return availableBytes; } // Getter function
-  size_t space() { return size - availableBytes; } // space available to write
+  size_t available() { 
+    if(!initialized || !data || size == 0) return 0;
+    size_t avail = availableBytes;
+    if(avail > size) return 0; // Corruption detected
+    return avail; 
+  }
+  size_t space() { 
+    if(!initialized || !data || size == 0) return 0;
+    size_t avail = availableBytes;
+    if(avail > size) return 0; // Corruption detected
+    return size - avail; 
+  }
   
   size_t write(const uint8_t *src, size_t len) {
-    if(len == 0) return 0;
-    size_t availSpace = space();
+    if(!initialized || len == 0 || !data || !src || size == 0) return 0;
+    
+    // Calculate available space safely with atomic-like protection
+    size_t currentAvailable = availableBytes;
+    if(currentAvailable > size) {
+      // Corruption detected - reset safely
+      writePos = 0;
+      readPos = 0;
+      availableBytes = 0;
+      currentAvailable = 0;
+    }
+    size_t availSpace = size - currentAvailable;
+    if(availSpace == 0) return 0;
+    
     size_t toWrite = (len < availSpace) ? len : availSpace;
-    if(toWrite == 0) return 0;
+    if(toWrite == 0 || toWrite > size) return 0; // Additional safety check
     
     size_t wp = writePos;
-    size_t firstPart = (toWrite < (size - wp)) ? toWrite : (size - wp);
-    memcpy(data + wp, src, firstPart);
-    writePos = (wp + firstPart) % size;
+    if(wp >= size) wp = 0; // Safety clamp
     
-    if(toWrite > firstPart) {
-      memcpy(data + writePos, src + firstPart, toWrite - firstPart);
-      writePos = (writePos + toWrite - firstPart) % size;
+    // Write in two parts if wrap-around needed
+    size_t firstPart = (toWrite <= (size - wp)) ? toWrite : (size - wp);
+    if(firstPart > 0 && (wp + firstPart) <= size) {
+      memcpy(data + wp, src, firstPart);
+    } else {
+      firstPart = 0; // Safety: don't write if bounds check fails
     }
     
-    availableBytes += toWrite;
+    // Second part if wrap-around
+    if(toWrite > firstPart) {
+      size_t secondPart = toWrite - firstPart;
+      if(secondPart > 0 && secondPart <= size && secondPart <= wp) {
+        memcpy(data, src + firstPart, secondPart);
+      } else {
+        toWrite = firstPart; // Adjust toWrite if second part fails
+      }
+    }
+    
+    if(toWrite == 0) return 0; // Safety: don't update if nothing written
+    
+    // Update write position atomically
+    writePos = (wp + toWrite) % size;
+    
+    // Update available bytes with safety clamp
+    size_t newAvailable = currentAvailable + toWrite;
+    if(newAvailable > size) {
+      // Corruption detected - reset
+      writePos = 0;
+      readPos = 0;
+      availableBytes = 0;
+      return 0;
+    }
+    availableBytes = newAvailable;
+    
     return toWrite;
   }
   
   size_t read(uint8_t *dst, size_t len) {
-    if(len == 0 || availableBytes == 0) return 0;
+    if(!initialized || len == 0 || !data || !dst || size == 0) return 0;
+    
     size_t avail = availableBytes;
+    if(avail > size) {
+      // Corruption detected - reset safely
+      writePos = 0;
+      readPos = 0;
+      availableBytes = 0;
+      avail = 0;
+    }
+    if(avail == 0) return 0;
+    
     size_t toRead = (len < avail) ? len : avail;
+    if(toRead == 0 || toRead > size) return 0; // Additional safety check
     
     size_t rp = readPos;
-    size_t firstPart = (toRead < (size - rp)) ? toRead : (size - rp);
-    memcpy(dst, data + rp, firstPart);
-    readPos = (rp + firstPart) % size;
+    if(rp >= size) rp = 0; // Safety clamp
     
-    if(toRead > firstPart) {
-      memcpy(dst + firstPart, data + readPos, toRead - firstPart);
-      readPos = (readPos + toRead - firstPart) % size;
+    // Read in two parts if wrap-around needed
+    size_t firstPart = (toRead <= (size - rp)) ? toRead : (size - rp);
+    if(firstPart > 0 && (rp + firstPart) <= size) {
+      memcpy(dst, data + rp, firstPart);
+    } else {
+      firstPart = 0; // Safety: don't read if bounds check fails
     }
     
-    availableBytes -= toRead;
+    // Second part if wrap-around
+    if(toRead > firstPart) {
+      size_t secondPart = toRead - firstPart;
+      if(secondPart > 0 && secondPart <= size && secondPart <= rp) {
+        memcpy(dst + firstPart, data, secondPart);
+      } else {
+        toRead = firstPart; // Adjust toRead if second part fails
+      }
+    }
+    
+    if(toRead == 0) return 0; // Safety: don't update if nothing read
+    
+    // Update read position atomically
+    readPos = (rp + toRead) % size;
+    
+    // Update available bytes with safety clamp
+    size_t newAvailable = avail - toRead;
+    if(newAvailable > size || newAvailable > avail) {
+      // Corruption detected - reset
+      writePos = 0;
+      readPos = 0;
+      availableBytes = 0;
+      return 0;
+    }
+    availableBytes = newAvailable;
+    
     return toRead;
   }
   
@@ -621,28 +732,24 @@ static int findDataChunk(const uint8_t *buf, size_t len){
 
 void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
   unsigned long playbackStartMs = millis();
-  Serial.printf("[PLAY][START] url=%s ringBufferSize=%.1fMB\n", 
-    url.substring(0, 60).c_str(), 
-    RING_BUFFER_SIZE / (1024.0f * 1024.0f));
+  
   WiFiClientSecure secure;
-  secure.setInsecure(); // presigned S3 uses public CA; allow default, or setCACert if needed
+  secure.setInsecure();
   HTTPClient http;
   http.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-  http.setTimeout(15000);
-  if(!http.begin(secure, url)){ Serial.println("[HTTP] begin failed"); return; }
+  http.setTimeout(30000);
+  http.setReuse(true);
+  if(!http.begin(secure, url)){ return; }
   int code = http.GET();
   if(code != HTTP_CODE_OK && code != HTTP_CODE_PARTIAL_CONTENT){
     Serial.printf("[HTTP] GET %d\n", code);
     http.end(); return;
   }
   
-  // Get Content-Length if available for accurate end-of-stream detection
   int contentLength = http.getSize();
-  
   WiFiClient *stream = http.getStreamPtr();
-  if(!stream){ Serial.println("[HTTP] no stream"); http.end(); return; }
+  if(!stream){ http.end(); return; }
 
-  // Read header until "data" chunk (or max)
   const size_t HDR_MAX = 16*1024;
   uint8_t *hdr = (uint8_t*)malloc(HDR_MAX);
   if(!hdr){ http.end(); return; }
@@ -658,88 +765,80 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     if(!stream->connected()) break;
     delay(2);
   }
-  if(dataAt<0){ Serial.println("[PLAY] not a WAV (no data chunk)"); free(hdr); http.end(); return; }
+  if(dataAt<0){ free(hdr); http.end(); return; }
   
-  // Determine expected total bytes (Content-Length minus header we already read)
+  size_t pcmStart = dataAt + 8;
   size_t expectedTotalBytes = 0;
   if(contentLength > 0){
     expectedTotalBytes = (size_t)contentLength;
-    Serial.printf("[HTTP] Content-Length: %d bytes (%.1f kB), header=%u bytes\n", 
-      contentLength, contentLength / 1024.0f, (unsigned)hdrPos);
-  } else {
-    Serial.println("[HTTP] Content-Length not available - using stream detection");
+  }
+  
+  size_t expectedDataBytes = 0;
+  if(expectedTotalBytes > 0){
+    size_t headerSize = pcmStart;
+    expectedDataBytes = (expectedTotalBytes > headerSize) ? (expectedTotalBytes - headerSize) : expectedTotalBytes;
   }
 
   uint32_t sampleRate = SAMPLE_RATE; int channels = 1;
   if(hdrPos >= 24){
     int fmtPos = -1;
-    // Find "fmt " chunk (WAV format specification)
     for(size_t i=0;i+4<=hdrPos;i++){ 
       if(hdr[i]=='f'&&hdr[i+1]=='m'&&hdr[i+2]=='t'&&hdr[i+3]==' '){ 
-        fmtPos=(int)i; 
-        break; 
+        fmtPos=(int)i; break; 
       } 
     }
     if(fmtPos>=0 && fmtPos+16 <= (int)hdrPos){
-      // Parse WAV format chunk (little-endian)
-      // Offset 10-11: NumChannels (uint16_t)
       channels = hdr[fmtPos + 10] | (hdr[fmtPos + 11] << 8);
-      // Offset 12-15: SampleRate (uint32_t)
       sampleRate = (uint32_t)hdr[fmtPos + 12] | 
                    ((uint32_t)hdr[fmtPos+13]<<8) | 
                    ((uint32_t)hdr[fmtPos+14]<<16) | 
                    ((uint32_t)hdr[fmtPos+15]<<24);
-      
-      // Validate parsed values to prevent breaking
       if(channels < 1 || channels > 2) channels = 1;
       if(sampleRate < 8000 || sampleRate > 48000) sampleRate = SAMPLE_RATE;
-      
-      Serial.printf("[PLAY] WAV format: %uHz, %d channel(s)\n", (unsigned)sampleRate, channels);
-    } else {
-      Serial.println("[PLAY] WAV fmt chunk not found or incomplete - using defaults");
     }
   }
   if(sampleRateOverride) sampleRate = sampleRateOverride;
 
-  // Install I2S TX for playback
   if(!installI2STX(sampleRate)){ free(hdr); http.end(); return; }
 
-  struct StereoScratch {
+    struct StereoScratch {
     uint8_t *buf = nullptr;
     size_t cap = 0;
     ~StereoScratch(){
-      if(buf){
-        free(buf);
-        buf = nullptr;
-        cap = 0;
+      if(buf){ 
+        free(buf); 
+        buf = nullptr; 
+        cap = 0; 
       }
     }
     bool ensure(size_t need){
       if(cap >= need) return true;
-      uint8_t *tmp = (uint8_t*)realloc(buf, need);
-      if(!tmp) return false;
-      buf = tmp;
+      // Only allocate once - don't realloc to avoid heap fragmentation
+      if(buf) {
+        // If already allocated but too small, we can't resize safely
+        // Return false to indicate failure
+        return false;
+      }
+      if(need == 0) return false; // Safety check
+      buf = (uint8_t*)malloc(need);
+      if(!buf) return false;
       cap = need;
+      memset(buf, 0, need); // Initialize to zero
       return true;
     }
   } stereoScratch;
 
-  // Note: writeMonoAsStereo lambda removed - now handled in main playback loop
-
-  // Determine pcm start within hdr buffer
-  size_t pcmStart = dataAt + 8; // "data"+len(4) -> payload
   size_t firstBody = hdrPos > pcmStart ? hdrPos - pcmStart : 0;
 
-  // Initialize ring buffer FIRST - use it for entire playback (prebuffer + streaming)
   RingBuffer ringBuf;
   if(!ringBuf.init(RING_BUFFER_SIZE)){
-    Serial.println("[PLAY] ring buffer alloc failed");
     uninstallI2STX(); free(hdr); http.end(); return;
   }
   
   const size_t READ_BUF = PLAY_READ_BUF;
-  uint8_t *httpReadBuf = (uint8_t*)malloc(READ_BUF);
-  uint8_t *playbackBuf = (uint8_t*)malloc(READ_BUF * 2); // Larger for stereo conversion
+  // Increased HTTP read buffer for faster download (8KB -> 64KB to support READ_BUF * 8 reads)
+  uint8_t *httpReadBuf = (uint8_t*)malloc(READ_BUF * 8);
+  uint8_t *playbackBuf = (uint8_t*)malloc(READ_BUF * 2);
   if(!httpReadBuf || !playbackBuf){
     ringBuf.deinit();
     if(httpReadBuf) free(httpReadBuf);
@@ -747,80 +846,95 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     uninstallI2STX(); free(hdr); http.end(); return;
   }
   
-  // Pre-allocate stereoScratch to maximum size needed (READ_BUF * 2 for mono-to-stereo conversion)
-  // This prevents heap corruption from reallocation during active playback
-  const size_t MAX_STEREO_BUF = READ_BUF * 2; // Maximum stereo buffer size needed
+  const size_t MAX_STEREO_BUF = READ_BUF * 2;
   if(!stereoScratch.ensure(MAX_STEREO_BUF)){
-    Serial.println("[PLAY] stereoScratch pre-allocation failed");
     ringBuf.deinit();
     free(httpReadBuf);
     free(playbackBuf);
     uninstallI2STX(); free(hdr); http.end(); return;
   }
-  Serial.printf("[PLAY] Pre-allocated stereoScratch: %.1fkB\n", MAX_STEREO_BUF / 1024.0f);
 
-  // Streaming telemetry
   size_t statsTotalHttp = 0;
   size_t statsTotalI2S = 0;
-  size_t statsWindowHttp = 0;
-  size_t statsWindowI2S = 0;
-  uint32_t httpChunkCount = 0;
-  uint32_t i2sChunkCount = 0;
-  size_t httpBytesDownloadedMono = 0; // Track mono-equivalent bytes downloaded
-  size_t i2sBytesPlayedMono = 0; // Track mono-equivalent bytes played
+  size_t httpBytesDownloadedMono = 0;
+  size_t i2sBytesPlayedMono = 0;
   unsigned long statsWindowStart = millis();
-  unsigned long lastUnderrunWarning = 0;
-  const size_t CHUNK_SIZE_LOG = 8192; // 8KB logical chunks for logging
-  const size_t MIN_BUFFER_WARNING = 8 * 1024; // Warn if buffer < 8KB
   
-  // Put firstBody into ring buffer immediately
   if(firstBody > 0){
     size_t written = ringBuf.write(hdr + pcmStart, firstBody);
     statsTotalHttp += written;
-    statsWindowHttp += written;
     httpBytesDownloadedMono += written;
-    httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
   }
   
-  // ===== DIRECT STREAMING: Minimal buffer, then continuous download+playback =====
-  Serial.printf("[PLAY][STREAM] Direct streaming mode - minimal buffer (%.1fkB) then continuous playback\n",
-    MIN_STREAM_BUFFER / 1024.0f);
-  
-  unsigned long downloadStart = millis();
+  bool isSmallFile = (expectedDataBytes > 0 && expectedDataBytes < INITIAL_BUFFER_TARGET);
   bool downloadComplete = false;
   bool rainbowStarted = false;
   
-  // Quick initial buffer fill (16KB minimum for smoothness)
-  while(stream->connected() && ringBuf.available() < MIN_STREAM_BUFFER){
-    int avail = stream->available();
-    size_t ringSpace = ringBuf.space();
-    
-    if(avail > 0 && ringSpace > 0){
-      int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
-      if(toRead > (int)ringSpace) toRead = (int)ringSpace;
+  if(isSmallFile){
+    size_t maxDownloadBytes = (expectedDataBytes > RING_BUFFER_SIZE) ? RING_BUFFER_SIZE : expectedDataBytes;
+    while(stream->connected() && httpBytesDownloadedMono < maxDownloadBytes){
+      int avail = stream->available();
+      size_t ringSpace = ringBuf.space();
       
-      int r = stream->readBytes(httpReadBuf, toRead);
-      if(r > 0){
-        size_t written = ringBuf.write(httpReadBuf, r);
-        statsTotalHttp += written;
-        statsWindowHttp += written;
-        httpBytesDownloadedMono += written;
-        httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
+      if(avail > 0 && ringSpace > 0){
+        // Increased from READ_BUF * 4 to READ_BUF * 8 for faster download
+        int toRead = (avail < (int)READ_BUF * 8) ? avail : (int)READ_BUF * 8;
+        if(toRead > (int)ringSpace) toRead = (int)ringSpace;
+        size_t remainingToDownload = maxDownloadBytes - httpBytesDownloadedMono;
+        if(toRead > (int)remainingToDownload) toRead = (int)remainingToDownload;
+        
+        int r = stream->readBytes(httpReadBuf, toRead);
+        if(r > 0){
+          size_t written = ringBuf.write(httpReadBuf, r);
+          statsTotalHttp += written;
+          httpBytesDownloadedMono += written;
+        }
+      } else {
+        delay(1);
       }
-    } else {
-      delay(1);
+      
+      if(mqttClient.connected() && (millis() % 200 < 10)){
+        mqttClient.loop();
+      }
+    }
+    downloadComplete = true;
+  } else {
+    size_t maxDownloadBytes = (expectedDataBytes > RING_BUFFER_SIZE) ? RING_BUFFER_SIZE : expectedDataBytes;
+    size_t initialTarget = (INITIAL_BUFFER_TARGET < maxDownloadBytes) ? INITIAL_BUFFER_TARGET : maxDownloadBytes;
+    
+    while(stream->connected() && ringBuf.available() < initialTarget && httpBytesDownloadedMono < maxDownloadBytes){
+      int avail = stream->available();
+      size_t ringSpace = ringBuf.space();
+      
+      if(avail > 0 && ringSpace > 0){
+        // Increased read size for faster download - read as much as possible
+        int toRead = (avail < (int)READ_BUF * 12) ? avail : (int)READ_BUF * 12; // Increased from 8 to 12
+        if(toRead > (int)ringSpace) toRead = (int)ringSpace;
+        size_t remainingToDownload = maxDownloadBytes - httpBytesDownloadedMono;
+        if(toRead > (int)remainingToDownload) toRead = (int)remainingToDownload;
+        
+        int r = stream->readBytes(httpReadBuf, toRead);
+        if(r > 0){
+          size_t written = ringBuf.write(httpReadBuf, r);
+          statsTotalHttp += written;
+          httpBytesDownloadedMono += written;
+        }
+      } else {
+        delay(0); // No delay if data available
+      }
+      
+      // MQTT loop less frequently during download for speed
+      if(mqttClient.connected() && (millis() % 300 < 5)){
+        mqttClient.loop();
+      }
     }
     
-    if(mqttClient.connected() && (millis() % 200 < 10)){
-      mqttClient.loop();
+    if(httpBytesDownloadedMono >= maxDownloadBytes){
+      downloadComplete = true;
     }
   }
   
-  Serial.printf("[PLAY][STREAM] Initial buffer ready: %.1fkB - starting direct streaming\n",
-    ringBuf.available() / 1024.0f);
-  
   if(ringBuf.available() == 0){
-    Serial.println("[PLAY] ERROR: Ring buffer is empty!");
     ringBuf.deinit();
     free(httpReadBuf);
     free(playbackBuf);
@@ -830,380 +944,285 @@ void playUrlWavBlocking(const String &url, uint32_t sampleRateOverride){
     return;
   }
   
-  auto logPlaybackStats = [&](const char* phase, int streamAvailable = -1, bool isPaused = false, size_t ringBufFill = 0) {
-    unsigned long now = millis();
-    unsigned long elapsed = now - statsWindowStart;
-    if(elapsed >= PLAY_STATS_INTERVAL_MS) {
-      float sec = elapsed / 1000.0f;
-      float netKBps = sec > 0 ? (statsWindowHttp / 1024.0f) / sec : 0.0f;
-      float playKBps = sec > 0 ? (statsWindowI2S / 1024.0f) / sec : 0.0f;
-      float httpChunksPerSec = sec > 0 ? (httpChunkCount / sec) : 0.0f;
-      float i2sChunksPerSec = sec > 0 ? (i2sChunkCount / sec) : 0.0f;
-      
-      // Use ring buffer fill (most accurate)
-      size_t bufferFillBytes = ringBufFill;
-      float bufferFillKB = bufferFillBytes / 1024.0f;
-      uint32_t bufferChunks = bufferFillBytes / CHUNK_SIZE_LOG;
-      
-      // Check for buffer underrun risk
-      bool lowBuffer = bufferFillBytes < MIN_BUFFER_WARNING;
-      if(lowBuffer && (now - lastUnderrunWarning) > 2000) { // Warn max once per 2s
-        Serial.printf("[PLAY][WARN] LOW_BUFFER bufferFill=%.1fkB downloadSpeed=%.1fkB/s playbackSpeed=%.1fkB/s streamAvailable=%d\n",
-          bufferFillKB, netKBps, playKBps, streamAvailable);
-        lastUnderrunWarning = now;
-      }
-      
-      float speedRatio = playKBps > 0 ? (netKBps / playKBps) : 0.0f;
-      const char* pauseStatus = isPaused ? "PAUSED" : "PLAYING";
-      Serial.printf("[PLAY][STAT] %s %s win=%.2fs net=%.1fkB/s play=%.1fkB/s speedRatio=%.2f httpChunks=%u i2sChunks=%u httpChunks/s=%.1f i2sChunks/s=%.1f ringBufFill=%.1fkB bufferChunks=%u streamAvail=%d totalDl=%.1fkB totalPlay=%.1fkB\n",
-        phase,
-        pauseStatus,
-        sec,
-        netKBps,
-        playKBps,
-        speedRatio,
-        httpChunkCount,
-        i2sChunkCount,
-        httpChunksPerSec,
-        i2sChunksPerSec,
-        bufferFillKB,
-        bufferChunks,
-        streamAvailable,
-        statsTotalHttp / 1024.0f,
-        statsTotalI2S / 1024.0f);
-      statsWindowHttp = 0;
-      statsWindowI2S = 0;
-      httpChunkCount = 0;
-      i2sChunkCount = 0;
-      statsWindowStart = now;
-    }
-  };
-
-  // ===== DIRECT STREAMING LOOP: Continuous download + playback =====
   bool playbackComplete = false;
+  bool playbackPaused = false;
+  unsigned long lastResumeTime = 0;
+  const unsigned long RESUME_GRACE_PERIOD_MS = 1000UL;
   
   while(!playbackComplete){
     unsigned long now = millis();
     size_t ringBufferFill = ringBuf.available();
     
-    // ===== DOWNLOAD TASK: Continuously read from HTTP and feed ring buffer =====
-    // Priority: Download has highest priority to prevent buffer underrun
+    // Download task
     if(stream->connected() && !downloadComplete){
-      int avail = stream->available();
-      size_t ringSpace = ringBuf.space();
-      
-      // Aggressive download: Always try to download when data is available
-      if(avail > 0 && ringSpace > 0){
-        // Read as much as possible (up to READ_BUF or available space)
-        int toRead = (avail < (int)READ_BUF) ? avail : (int)READ_BUF;
-        if(toRead > (int)ringSpace) toRead = (int)ringSpace;
+      if(httpBytesDownloadedMono >= RING_BUFFER_SIZE){
+        downloadComplete = true;
+      } else {
+        int avail = stream->available();
+        size_t ringSpace = ringBuf.space();
         
-        // If buffer is low, try to read even more aggressively
-        if(ringBufferFill < LOW_BUFFER_THRESHOLD && avail > toRead){
-          int maxRead = (int)READ_BUF * 2; // Can read up to 2x READ_BUF
-          if(maxRead > (int)ringSpace) maxRead = (int)ringSpace;
-          if(maxRead > toRead && avail >= maxRead) toRead = maxRead;
-        }
-        
-        int r = stream->readBytes(httpReadBuf, toRead);
-        if(r > 0){
-          size_t written = ringBuf.write(httpReadBuf, r);
-          statsTotalHttp += written;
-          statsWindowHttp += written;
-          httpBytesDownloadedMono += written;
-          httpChunkCount += ((written + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
-        }
-      } else if(avail <= 0 && !stream->connected()){
-        // Check if download is complete
-        if(expectedTotalBytes > 0){
-          size_t headerSize = pcmStart;
-          size_t expectedDataBytes = expectedTotalBytes > headerSize ? (expectedTotalBytes - headerSize) : expectedTotalBytes;
-          if(httpBytesDownloadedMono >= expectedDataBytes || 
-             (expectedDataBytes - httpBytesDownloadedMono) < 4096){
-            downloadComplete = true;
-            Serial.printf("[PLAY][STREAM] Download complete: %.1fkB total\n",
-              httpBytesDownloadedMono / 1024.0f);
+        if(avail > 0 && ringSpace > 0){
+          // Increased read size for faster download - read as much as possible
+          int toRead = (avail < (int)READ_BUF * 16) ? avail : (int)READ_BUF * 16; // Increased from 8 to 16 for faster download
+          if(toRead > (int)ringSpace) toRead = (int)ringSpace;
+          size_t remainingToDownload = RING_BUFFER_SIZE - httpBytesDownloadedMono;
+          if(toRead > (int)remainingToDownload) toRead = (int)remainingToDownload;
+          
+          if(ringBufferFill < LOW_BUFFER_THRESHOLD && avail > toRead){
+            int maxRead = (int)READ_BUF * 20; // Increased from 12 to 20 for faster buffering when low
+            if(maxRead > (int)ringSpace) maxRead = (int)ringSpace;
+            if(maxRead > (int)remainingToDownload) maxRead = (int)remainingToDownload;
+            if(maxRead > toRead && avail >= maxRead) toRead = maxRead;
           }
-        } else {
-          // No Content-Length - wait a bit and check
-          delay(500);
-          if(!stream->connected() && stream->available() == 0){
-            downloadComplete = true;
-            Serial.println("[PLAY][STREAM] Stream disconnected - download complete");
+          
+          int r = stream->readBytes(httpReadBuf, toRead);
+          if(r > 0){
+            size_t written = ringBuf.write(httpReadBuf, r);
+            statsTotalHttp += written;
+            httpBytesDownloadedMono += written;
+            
+            if(httpBytesDownloadedMono >= RING_BUFFER_SIZE){
+              downloadComplete = true;
+            }
+          }
+        } else if(avail <= 0 && !stream->connected()){
+          if(expectedDataBytes > 0){
+            if(httpBytesDownloadedMono >= expectedDataBytes || 
+               (expectedDataBytes - httpBytesDownloadedMono) < 4096 ||
+               httpBytesDownloadedMono >= RING_BUFFER_SIZE){
+              downloadComplete = true;
+            }
+          } else {
+            delay(500);
+            if(!stream->connected() && stream->available() == 0){
+              downloadComplete = true;
+            }
           }
         }
       }
     }
     
-    // ===== PLAYBACK TASK: Read from ring buffer and feed I2S =====
-    // Adaptive playback: Pause if buffer too low, resume when sufficient
-    static bool playbackPaused = false;
-    static unsigned long lastResumeTime = 0;
-    static const unsigned long RESUME_GRACE_PERIOD_MS = 1000UL; // 1 second grace period after resume
-    
-    // Pause if buffer too low (only if not already paused to avoid spam)
-    // Add grace period: don't pause immediately after resume
+    // Playback task
     unsigned long timeSinceResume = millis() - lastResumeTime;
     bool inGracePeriod = timeSinceResume < RESUME_GRACE_PERIOD_MS;
     
     if(ringBufferFill < LOW_BUFFER_THRESHOLD && !downloadComplete && !inGracePeriod){
       if(!playbackPaused){
         playbackPaused = true;
-        Serial.printf("[PLAY][PAUSE] Buffer low: %.1fkB < %.1fkB - pausing to fill buffer\n",
-          ringBufferFill / 1024.0f, LOW_BUFFER_THRESHOLD / 1024.0f);
       }
-      // Skip playback, let download fill buffer
-      delay(20); // Give download more time to fill
+      delay(20);
       continue;
     }
     
-    // Resume if buffer sufficient
     if(playbackPaused && ringBufferFill >= RESUME_BUFFER_THRESHOLD){
       playbackPaused = false;
       lastResumeTime = millis();
-      Serial.printf("[PLAY][RESUME] Buffer sufficient: %.1fkB >= %.1fkB - resuming playback\n",
-        ringBufferFill / 1024.0f, RESUME_BUFFER_THRESHOLD / 1024.0f);
     }
     
-    // If paused, skip playback
     if(playbackPaused){
       delay(10);
       continue;
     }
     
     if(ringBufferFill == 0){
-      // No data available - check if we're done
       if(downloadComplete){
         playbackComplete = true;
-        Serial.printf("[PLAY][STREAM] Playback complete - all data played\n");
         break;
       } else {
-        // Still downloading, wait a bit
         delay(5);
         continue;
       }
     }
     
-    // Read available data from ring buffer (up to READ_BUF)
-    // Multi-zone adaptive read size: Read smaller chunks when buffer is low to prevent rapid consumption
     size_t toPlay = READ_BUF;
-    
-    // Zone-based adaptive reading for smooth playback
-    if(ringBufferFill >= CRITICAL_ZONE){
-      // Safe zone (>=24KB): Read full chunks (4KB) - buffer is healthy
+    if(ringBufferFill >= RESUME_BUFFER_THRESHOLD){
       toPlay = READ_BUF;
-    } else if(ringBufferFill >= STABLE_ZONE){
-      // Stable zone (18-24KB): Read medium chunks (2KB) - buffer is okay but not fully safe
+    } else if(ringBufferFill >= LOW_BUFFER_THRESHOLD){
       toPlay = 2 * 1024;
-    } else if(ringBufferFill >= RESUME_BUFFER_THRESHOLD){
-      // Critical zone (20-18KB): Read small chunks (1KB) - just resumed, be careful
+    } else if(ringBufferFill >= (LOW_BUFFER_THRESHOLD / 2)){
       toPlay = 1 * 1024;
     } else {
-      // Very low (below resume threshold but above pause): Read tiny chunks (512B) - emergency mode
       toPlay = 512;
     }
     
-    // Safety: Don't read more than available
     if(ringBufferFill < toPlay) toPlay = ringBufferFill;
     
-    // Additional throttling: If just resumed (in grace period), read even smaller
-    if(inGracePeriod && toPlay > 512){
-      toPlay = 512; // Very conservative during grace period
+    if(inGracePeriod && toPlay > 1 * 1024){
+      toPlay = 1 * 1024;
       if(ringBufferFill < toPlay) toPlay = ringBufferFill;
     }
     
     size_t readFromRing = ringBuf.read(playbackBuf, toPlay);
       
-      if(readFromRing > 0){
-        bool okWrite = true;
-        size_t playedBytes = 0;
-        
-        if(channels == 1){
-          // Mono-to-stereo conversion
-          size_t samples = readFromRing / 2;
-          if(samples > 0){
-            size_t outBytes = samples * 4;
-            // Safety check: Ensure we don't exceed pre-allocated buffer size
-            if(outBytes > stereoScratch.cap){
-              Serial.printf("[PLAY] ERROR: outBytes (%u) > pre-allocated buffer (%u) - clamping\n",
-                (unsigned)outBytes, (unsigned)stereoScratch.cap);
-              outBytes = stereoScratch.cap;
-              samples = outBytes / 4;
-              readFromRing = samples * 2; // Adjust readFromRing to match
-            }
-            // Ensure buffer is ready (should always succeed since pre-allocated)
-            if(!stereoScratch.ensure(outBytes)){
-              Serial.println("[PLAY] stereo buffer alloc failed");
+    if(readFromRing > 0){
+      bool okWrite = true;
+      size_t playedBytes = 0;
+      
+      if(channels == 1){
+        size_t samples = readFromRing / 2;
+        if(samples > 0){
+          size_t outBytes = samples * 4;
+          if(outBytes > stereoScratch.cap){
+            outBytes = stereoScratch.cap;
+            samples = outBytes / 4;
+            readFromRing = samples * 2;
+          }
+          if(!stereoScratch.ensure(outBytes)){
+            okWrite = false;
+          } else {
+            uint8_t *dst = stereoScratch.buf;
+            if(!dst || stereoScratch.cap < outBytes) {
               okWrite = false;
             } else {
-              uint8_t *dst = stereoScratch.buf;
               for(size_t i=0;i<samples;i++){
                 uint8_t lo = playbackBuf[i*2+0];
                 uint8_t hi = playbackBuf[i*2+1];
                 size_t o = i*4;
-                dst[o+0]=lo; dst[o+1]=hi;
-                dst[o+2]=lo; dst[o+3]=hi;
+                if(o + 3 < stereoScratch.cap) {
+                  dst[o+0]=lo; dst[o+1]=hi;
+                  dst[o+2]=lo; dst[o+3]=hi;
+                }
               }
               size_t written = 0;
-              // Use blocking write with longer timeout (500ms) to ensure data is written
-              // This prevents data loss and ensures smooth playback without breaking
               TickType_t timeout = pdMS_TO_TICKS(500);
               esp_err_t err = i2s_write(I2S_NUM_1, dst, outBytes, &written, timeout);
               if(err != ESP_OK){
-                Serial.printf("[PLAY] i2s_write failed: %d\n", err);
                 okWrite = false;
               } else {
                 playedBytes = written;
-                // Start rainbow LED only when first I2S write succeeds (actual playback starts)
                 if(!rainbowStarted && written > 0){
+                  // Sound started - start rainbow immediately
                   rainbowStarted = true;
                   ledState = LS_PLAYING;
-                  Serial.println("[PLAY] Playback started - rainbow LED enabled");
-                }
-                // If not all data was written, log warning but continue
-                if(written < outBytes){
-                  Serial.printf("[PLAY][WARN] Partial write: %u/%u bytes (DMA buffer may be full)\n",
-                    (unsigned)written, (unsigned)outBytes);
+                  ledRainbowStepFast(); // Start rainbow immediately when sound starts
                 }
               }
             }
           }
+        }
+      } else {
+        size_t written = 0;
+        TickType_t timeout = pdMS_TO_TICKS(500);
+        esp_err_t err = i2s_write(I2S_NUM_1, playbackBuf, readFromRing, &written, timeout);
+        if(err != ESP_OK){
+          okWrite = false;
         } else {
-          // Stereo data - write directly
-          size_t written = 0;
-          TickType_t timeout = pdMS_TO_TICKS(500);
-          esp_err_t err = i2s_write(I2S_NUM_1, playbackBuf, readFromRing, &written, timeout);
-          if(err != ESP_OK){
-            Serial.printf("[PLAY] i2s_write failed: %d\n", err);
-            okWrite = false;
-          } else {
-            playedBytes = written;
-            // Start rainbow LED only when first I2S write succeeds (actual playback starts)
-            if(!rainbowStarted && written > 0){
-              rainbowStarted = true;
-              ledState = LS_PLAYING;
-              Serial.println("[PLAY] Playback started - rainbow LED enabled");
-            }
-            // If not all data was written, log warning
-            if(written < readFromRing){
-              Serial.printf("[PLAY][WARN] Partial write: %u/%u bytes\n",
-                (unsigned)written, (unsigned)readFromRing);
-            }
-          }
-        }
-        
-        if(!okWrite){
-          Serial.println("[PLAY] write failed, aborting playback");
-          break;
-        }
-        
-        if(playedBytes > 0){
-          // For stats: convert stereo bytes to mono-equivalent for fair comparison
-          size_t monoEquivalentBytes = (channels == 1) ? (playedBytes / 2) : playedBytes;
-          statsTotalI2S += monoEquivalentBytes;  // Track mono-equivalent bytes
-          statsWindowI2S += monoEquivalentBytes;
-          i2sChunkCount += ((monoEquivalentBytes + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG);
-          
-          // Adaptive throttling: Add small delay when buffer is in critical zones
-          // This gives download time to catch up
-          if(ringBufferFill < CRITICAL_ZONE){
-            if(ringBufferFill < STABLE_ZONE){
-              delay(3); // Critical zone: 3ms delay
-            } else {
-              delay(1); // Stable zone: 1ms delay
-            }
+          playedBytes = written;
+          if(!rainbowStarted && written > 0){
+            // Sound started - start rainbow immediately
+            rainbowStarted = true;
+            ledState = LS_PLAYING;
+            ledRainbowStepFast(); // Start rainbow immediately when sound starts
           }
         }
       }
-    
-    // If we read small chunks (buffer low), add small delay to give download time
-    if(toPlay < (READ_BUF / 2)){
-      delay(2); // Small delay when reading small chunks
+      
+      if(!okWrite){
+        break;
+      }
+      
+      if(playedBytes > 0){
+        size_t monoEquivalentBytes = (channels == 1) ? (playedBytes / 2) : playedBytes;
+        statsTotalI2S += monoEquivalentBytes;
+        
+        if(ringBufferFill < LOW_BUFFER_THRESHOLD){
+          delay(2);
+        }
+      }
     }
     
-    // Check if playback is complete
+    if(toPlay < (READ_BUF / 2)){
+      delay(2);
+    }
+    
     if(ringBuf.available() == 0 && downloadComplete){
       playbackComplete = true;
-      Serial.printf("[PLAY][STREAM] Playback complete - all data played from ring buffer\n");
+      // Playback ended - stop rainbow immediately before breaking
+      if(rainbowStarted){
+        rainbowStarted = false;
+        ledState = LS_RANDOM_RGB;
+        lastActivityMs = millis();
+        lastRandomRgbChange = millis();
+        ledRandomRgb(); // Stop rainbow immediately
+      }
       break;
     }
     
-    // Log stats periodically
-    logPlaybackStats("playback", stream->available(), playbackPaused, ringBufferFill);
-    
-    // Update rainbow LED only if playback has started and not paused
-    if(rainbowStarted && !playbackPaused){
-      ledRainbowStepFast();
+    // Update rainbow continuously while sound is playing
+    // Only update if playback is actually active and not paused
+    if(rainbowStarted && !playbackPaused && ledState == LS_PLAYING){
+      ledRainbowStepFast(); // Rainbow synchronized with sound playback
     }
     
-    // Allow MQTT to process during playback (but less frequently to avoid breaking)
     static unsigned long lastMQTTLoop = 0;
     if(mqttClient.connected() && (now - lastMQTTLoop > 100)){
       mqttClient.loop();
       lastMQTTLoop = now;
     }
-    
-    // Small yield to allow other tasks (but minimal to prevent breaking)
-    // No delay - let FreeRTOS handle scheduling naturally
   }
   
-  // Stop rainbow LED immediately when playback ends
+  // Sound stopped - stop rainbow IMMEDIATELY (before any cleanup)
   if(rainbowStarted){
+    rainbowStarted = false;
+    // CRITICAL: Stop rainbow immediately - set state and update LEDs BEFORE any delays
+    ledState = LS_RANDOM_RGB; // Rainbow stops immediately when sound stops
+    lastActivityMs = millis();
+    lastRandomRgbChange = millis();
+    ledRandomRgb(); // Switch to random RGB immediately - NO rainbow after this
+    Serial.println("[LED] playback ended - rainbow stopped, random RGB");
+  }
+  
+  // Cleanup: StereoScratch destructor will free its buffer automatically when it goes out of scope
+  // Clear ring buffer first to ensure no pending operations
+  ringBuf.clear();
+  delay(5); // Reduced delay
+  
+  // Deinit ring buffer before freeing other buffers
+  ringBuf.deinit();
+  delay(2); // Reduced delay
+  
+  // Free allocated buffers in safe order
+  if(httpReadBuf) {
+    free(httpReadBuf);
+    httpReadBuf = nullptr;
+  }
+  if(playbackBuf) {
+    free(playbackBuf);
+    playbackBuf = nullptr;
+  }
+  if(hdr) {
+    free(hdr);
+    hdr = nullptr;
+  }
+  
+  // Close HTTP connection
+  http.end();
+  delay(2); // Reduced delay
+  
+  // Uninstall I2S
+  uninstallI2STX();
+  delay(5); // Reduced delay
+  
+  // Ensure LED state is still random RGB (not playing) after cleanup
+  if(ledState == LS_PLAYING){
     ledState = LS_RANDOM_RGB;
     lastActivityMs = millis();
     lastRandomRgbChange = millis();
-    Serial.println("[PLAY] Playback ended - rainbow LED stopped");
+    ledRandomRgb();
   }
-  
-  // ===== PHASE 3: CLEANUP =====
-  // Clean ring buffer after playback completes
-  Serial.printf("[PLAY][CLEANUP] Cleaning ring buffer (was %.1fkB)\n", 
-    ringBuf.available() / 1024.0f);
-  
-  ringBuf.clear();
-  ringBuf.deinit();
-  free(httpReadBuf);
-  free(playbackBuf);
-  free(hdr); 
-  http.end();
-  uninstallI2STX();
-  logPlaybackStats("final");
-  unsigned long totalMs = millis() - playbackStartMs;
-  float totalSec = totalMs / 1000.0f;
-  float avgDownloadKBps = totalSec > 0 ? (statsTotalHttp / 1024.0f) / totalSec : 0.0f;
-  float avgPlaybackKBps = totalSec > 0 ? (statsTotalI2S / 1024.0f) / totalSec : 0.0f;
-  uint32_t totalHttpChunks = (statsTotalHttp + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG;
-  uint32_t totalI2SChunks = (statsTotalI2S + CHUNK_SIZE_LOG - 1) / CHUNK_SIZE_LOG;
-  float avgHttpChunksPerSec = totalSec > 0 ? totalHttpChunks / totalSec : 0.0f;
-  float avgI2SChunksPerSec = totalSec > 0 ? totalI2SChunks / totalSec : 0.0f;
-  
-  Serial.printf("[PLAY][DONE] downloaded=%.1fkB played=%.1fkB duration=%.2fs avgDownloadSpeed=%.1fkB/s avgPlaybackSpeed=%.1fkB/s\n",
-    statsTotalHttp / 1024.0f,
-    statsTotalI2S / 1024.0f,
-    totalSec,
-    avgDownloadKBps,
-    avgPlaybackKBps);
-  Serial.printf("[PLAY][CHUNKS] httpChunks=%u i2sChunks=%u httpChunks/s=%.1f i2sChunks/s=%.1f chunkSize=%u\n",
-    totalHttpChunks,
-    totalI2SChunks,
-    avgHttpChunksPerSec,
-    avgI2SChunksPerSec,
-    (unsigned)CHUNK_SIZE_LOG);
 }
 
 // -------- MQTT message handling --------
 void handlePlayControlJson(const JsonDocument &doc){
   if(!doc.containsKey("url")){ Serial.println("[MQTT] play/control missing url"); return; }
   
-  // Prevent auto-replay: Check if busy, same URL, or too soon after last playback
-  if(playbackActive || isRecording){ 
+  if(playbackActive || isRecording || isStreaming){ 
     Serial.println("[PLAY] busy, ignoring"); 
     return; 
   }
   
   String url = doc["url"].as<String>();
   
-  // Prevent duplicate playback of same URL within cooldown period
   if(url == lastPlayedUrl && (millis() - lastPlaybackEndTime) < PLAYBACK_COOLDOWN_MS){
     Serial.printf("[PLAY] ignoring duplicate URL (cooldown: %lums)\n", 
       (unsigned long)(millis() - lastPlaybackEndTime));
@@ -1211,15 +1230,24 @@ void handlePlayControlJson(const JsonDocument &doc){
   }
   
   uint32_t sr = doc.containsKey("sampleRate") ? (uint32_t)doc["sampleRate"].as<uint32_t>() : 0;
-  playbackActive = true; // Button will be disabled automatically
-  lastPlayedUrl = url; // Store URL to prevent duplicate playback
+  Serial.printf("[PLAY] start url=%s sampleRate=%u\n", url.substring(0, 60).c_str(), (unsigned)sr);
+  playbackActive = true; // Button disabled
+  lastPlayedUrl = url;
   if(recorderInstalled){ uninstallI2SRecorder(); delay(40); }
-  // DO NOT set ledState here - rainbow will start only when actual playback starts (first I2S write)
   playUrlWavBlocking(url, sr);
-  // After streaming: Random RGB, then idle animation after 15s (already set in playUrlWavBlocking)
-  lastPlaybackEndTime = millis(); // Track when playback ended
+  // Rainbow already stopped in playUrlWavBlocking when sound ends
+  // CRITICAL: Ensure playbackActive is false and LED state is random RGB immediately after playback
+  playbackActive = false; // Button enabled - set BEFORE any other operations
+  if(ledState == LS_PLAYING){
+    ledState = LS_RANDOM_RGB; // Force state to random RGB if still playing
+    lastActivityMs = millis();
+    lastRandomRgbChange = millis();
+    ledRandomRgb(); // Update LEDs immediately
+  }
+  lastPlaybackEndTime = millis();
+  lastActivityMs = millis();
   setupI2SRecorder();
-  playbackActive = false; // Button enabled again
+  Serial.println("[PLAY] done");
 }
 void mqttCallback(char* topic, byte* payload, unsigned int length){
   String top = String(topic);
@@ -1227,33 +1255,43 @@ void mqttCallback(char* topic, byte* payload, unsigned int length){
     DynamicJsonDocument doc(1024);
     DeserializationError err = deserializeJson(doc, payload, length);
     if(err){ Serial.println("[MQTT] JSON parse failed"); return; }
+    lastActivityMs = millis();
     handlePlayControlJson(doc);
   }
 }
 
 // -------- Factory reset --------
 void doFactoryReset(){
-  Serial.println("[RESET] factory reset");
-  ledState = LS_RESET; ledFill(255,0,0); delay(300);
+  Serial.println("[RESET] factory reset - long press 10s+");
+  ledState = LS_RESET;
+  ledFill(255,0,0); // Red light for factory reset
+  delay(500);
+  // Stop audio if playing
+  if(playbackActive){
+    playbackActive = false;
+    uninstallI2STX();
+  }
+  // Reset WiFi settings
   wm.resetSettings();
   WiFi.disconnect(true, true);
+  // Format LittleFS
   if(LittleFS.format()) Serial.println("[FS] formatted");
   else Serial.println("[FS] format FAILED");
   delay(200);
+  // Restart - will show blue light in captive portal
   ESP.restart();
 }
 
 // -------- Button handling --------
 void handleButtonTick(){
-  // Disable button during streaming and recording
-  if(playbackActive || isRecording){
-    // Reset button state if pressed during busy state
+  // Disable button during streaming, recording, and playback
+  if(playbackActive || isRecording || isStreaming){
     if(btnPhase != BP_IDLE){
       btnPhase = BP_IDLE;
       pressTs = 0;
       releaseTs = 0;
     }
-    return; // Button disabled
+    return;
   }
   
   bool raw = (digitalRead(BUTTON_PIN) == LOW);
@@ -1272,36 +1310,47 @@ void handleButtonTick(){
         doFactoryReset();
       } else {
         if(held <= SHORT_PRESS_MAX_MS){
-          // Short press: Start recording
-          isRecording = true;
+          // Short press: Start 8 second recording (button disabled during recording)
+          isRecording = true; // Button disabled during recording
           sessionCounter++; persistSessionCounter();
           char sid[32]; snprintf(sid, sizeof(sid), "%lu", sessionCounter);
-          Serial.printf("[BTN] short press -> record sid=%s\n", sid);
-          ledState = LS_RECORDING; ledFill(0,0,255);
+          Serial.printf("[BTN] short press -> record 8s sid=%s\n", sid);
+          ledState = LS_RECORDING; 
+          ledFill(0,0,255); // Blue light during 8 second recording
           lastActivityMs = now;
           recordTimedToFile(sid, RECORD_TIMEOUT_MS);
-          // After recording: Stream to MQTT (LED stays blue during recording, then streaming)
-          ledState = LS_STREAMING;
-          streamSessionFileToMQTT(sid);
-          // After recording and streaming: Random RGB, then idle animation after 15s
-          ledState = LS_RANDOM_RGB;
-          lastActivityMs = millis();
-          lastRandomRgbChange = millis();
-          isRecording = false;
+          // After recording: Stream to MQTT (button still disabled during streaming)
+          if(!playbackActive){
+            ledState = LS_STREAMING;
+            streamSessionFileToMQTT(sid);
+            // After streaming: Random RGB light, then idle animation after 15s
+            ledState = LS_RANDOM_RGB;
+            lastActivityMs = millis();
+            lastRandomRgbChange = millis();
+            ledRandomRgb(); // Show random RGB immediately
+          } else {
+            isRecording = false; // Button enabled if playback active
+          }
         } else {
-          // Medium press: treat as short
-          isRecording = true;
+          // Medium press: treat as short press
+          isRecording = true; // Button disabled during recording
           sessionCounter++; persistSessionCounter();
           char sid[32]; snprintf(sid, sizeof(sid), "%lu", sessionCounter);
-          Serial.printf("[BTN] medium press -> record sid=%s\n", sid);
-          ledState = LS_RECORDING; ledFill(0,0,255);
+          Serial.printf("[BTN] medium press -> record 8s sid=%s\n", sid);
+          ledState = LS_RECORDING; 
+          ledFill(0,0,255); // Blue light during recording
           lastActivityMs = now;
           recordTimedToFile(sid, RECORD_TIMEOUT_MS);
-          ledState = LS_STREAMING;
-          streamSessionFileToMQTT(sid);
-          ledState = LS_RANDOM_RGB;
-          lastActivityMs = millis();
-          isRecording = false;
+          if(!playbackActive){
+            ledState = LS_STREAMING;
+            streamSessionFileToMQTT(sid);
+            ledState = LS_RANDOM_RGB;
+            lastActivityMs = millis();
+            lastRandomRgbChange = millis();
+            ledRandomRgb(); // Show random RGB immediately
+          } else {
+            isRecording = false; // Button enabled if playback active
+          }
         }
       }
       btnPhase = BP_IDLE;
@@ -1321,35 +1370,35 @@ void setup(){
   ledInit(); ledState = LS_BOOT; ledFill(0,0,0);
   if(!ensureLittleFS()) while(1){ delay(1000); }
 
-  // WiFi: open portal with SSID only (no password)
+  // WiFi: open portal with SSID only (no password) - auto connect
   wm.setTimeout(120);
-  ledState = LS_PROVISION; ledFill(0,0,255);
-  if(!wm.autoConnect(AP_SSID)){
-    Serial.println("[WiFi] autoConnect failed; restarting...");
+  wm.setConfigPortalTimeout(120);
+  wm.setAPStaticIPConfig(IPAddress(192,168,4,1), IPAddress(192,168,4,1), IPAddress(255,255,255,0));
+  wm.setAPCallback([](WiFiManager *myWiFiManager) {
+    // AP started callback - blue light during provisioning
+    ledState = LS_PROVISION;
+    ledFill(0,0,255);
+  });
+  ledState = LS_PROVISION; ledFill(0,0,255); // Blue during provisioning
+  if(!wm.autoConnect(AP_SSID)){ // No password - open AP
     delay(2000); ESP.restart();
   }
-  // smoother streaming: keep radio awake
   WiFi.setSleep(false);
   Serial.printf("[WiFi] connected: %s\n", WiFi.localIP().toString().c_str());
-  ledState = LS_CONNECTED; ledFill(0,255,0);
+  ledState = LS_CONNECTED; ledFill(0,255,0); // Green when WiFi connected
   lastActivityMs = millis();
 
-  // TLS time (NTP)
   configTime(19800, 0, "pool.ntp.org", "time.google.com");
   delay(600);
 
-  // MQTT
   mqttClient.setCallback(mqttCallback);
   connectMQTT();
 
-  // Filters
   g_voice.init((float)SAMPLE_RATE);
   g_gate.reset();
 
-  // Start recorder by default
   setupI2SRecorder();
 
-  // Topics
   TOP_PLAY_CTRL = String(DEVICE_ID) + "/audio/play/control";
 
   Serial.println("[READY] Short press -> record 8s (upload). Long press >=10s -> factory reset.");
@@ -1357,7 +1406,6 @@ void setup(){
 
 unsigned long lastIdleAnim = 0;
 void loop(){
-  // MQTT keepalive
   if(WiFi.isConnected()){
     if(!mqttClient.connected()){
       if(millis() - lastMQTTAttempt > MQTT_RECONNECT_MS){
@@ -1367,52 +1415,46 @@ void loop(){
     } else mqttClient.loop();
   }
 
-  // Button handling (locked-out while busy handled inside FSM conditions)
   handleButtonTick();
 
-  // LED policy
   unsigned long now = millis();
   
-  // Priority 1: WiFi disconnected - Blue (unless recording/reset)
+  // Priority 1: WiFi disconnected - Blue light
   if(!WiFi.isConnected()){
-    if(ledState != LS_RECORDING && ledState != LS_RESET && !playbackActive) { 
+    if(ledState != LS_RECORDING && ledState != LS_RESET && !playbackActive && !isStreaming && !isRecording) { 
       ledState = LS_DISCONNECTED; 
-      ledFill(0,0,255); 
+      ledFill(0,0,255); // Blue when WiFi disconnected
     }
   } 
-  // Priority 2: WiFi connected - Green (if no other active state)
-  else if(ledState == LS_DISCONNECTED && !playbackActive && !isRecording && ledState != LS_RESET){
+  // Priority 2: WiFi connected - Green light
+  else if(ledState == LS_DISCONNECTED && !playbackActive && !isRecording && !isStreaming && ledState != LS_RESET){
     ledState = LS_CONNECTED;
-    ledFill(0,255,0);
+    ledFill(0,255,0); // Green when WiFi connected
     lastActivityMs = now;
   }
   
-  // Priority 3: Recording - Blue (8 seconds)
-  // This is handled in recordTimedToFile() - no change needed
-  
-  // Priority 4: Streaming/Playback - Fast rainbow animation (STOPS when streaming stops)
-  // This is handled in playUrlWavBlocking() - ledRainbowStepFast() called during playback
-  // After playback, state changes to LS_RANDOM_RGB
-  
-  // Priority 5: After streaming/recording - Random RGB, then idle animation after 15s
+  // Priority 3: After streaming/recording - Random RGB, then idle animation after 15s
   if(ledState == LS_RANDOM_RGB){
-    // Update random RGB every 500ms while in this state
     if(now - lastRandomRgbChange > 500){
       ledRandomRgb();
       lastRandomRgbChange = now;
     }
-    // After 15s idle, switch to animation theme
-    if(now - lastActivityMs > IDLE_ANIM_AFTER_MS){
+    // After 15s inactivity: Start animation theme (dhere dhere change)
+    if((now - lastActivityMs >= IDLE_ANIM_AFTER_MS) && 
+       !playbackActive && !isRecording && !isStreaming && WiFi.isConnected()){
       ledState = LS_IDLE_ANIM;
-      lastIdleAnim = now; // Initialize animation timer
+      lastIdleAnim = now;
+      Serial.println("[LED] idle animation started (15s inactivity)");
     }
   }
   
-  // Priority 6: After 15s idle (when connected and not busy) - Start animation theme
-  if(ledState == LS_CONNECTED && (now - lastActivityMs > IDLE_ANIM_AFTER_MS) && 
-     !playbackActive && !isRecording && WiFi.isConnected()){
+  // Priority 4: After 15s idle - Start animation theme (from CONNECTED or RANDOM_RGB)
+  if((ledState == LS_CONNECTED || ledState == LS_RANDOM_RGB) && 
+     (now - lastActivityMs >= IDLE_ANIM_AFTER_MS) && 
+     !playbackActive && !isRecording && !isStreaming && WiFi.isConnected()){
     ledState = LS_IDLE_ANIM;
-    lastIdleAnim = now; // Initialize animation timer
+    lastIdleAnim = now;
+    Serial.println("[LED] idle animation started (15s inactivity)");
   }
   
   // LED state machine - render current state
@@ -1421,7 +1463,6 @@ void loop(){
       ledFill(0,255,0); // Green - WiFi connected
       break;
     case LS_IDLE_ANIM:
-      // Slow RGB animation theme (ambient)
       if(now - lastIdleAnim > IDLE_ANIM_STEP_MS){
         lastIdleAnim = now;
         ledIdleAmbientStep();
@@ -1431,20 +1472,40 @@ void loop(){
       ledFill(0,0,255); // Blue - Recording (8 seconds)
       break;
     case LS_STREAMING:
-    case LS_PLAYING:
-      // Fast rainbow animation during streaming (handled in playUrlWavBlocking loop)
-      // This should only be active during actual playback
-      if(playbackActive){
+      // Rainbow theme ONLY during active streaming - STRICT check
+      // Must check BOTH isStreaming flag AND ledState to prevent delayed rainbow
+      if(isStreaming == true && ledState == LS_STREAMING){
+        // Continuously update rainbow ONLY while streaming is active
         ledRainbowStepFast();
       } else {
-        // If playback stopped but state didn't update, switch to random RGB
+        // Streaming ended - ensure state is cleared, NO rainbow updates
+        if(ledState == LS_STREAMING){
+          // State mismatch - force update to random RGB
+          isStreaming = false; // Ensure flag is cleared
+          ledState = LS_RANDOM_RGB;
+          lastActivityMs = now;
+          lastRandomRgbChange = now;
+          ledRandomRgb(); // Set random RGB immediately, NO rainbow
+        }
+      }
+      break;
+    case LS_PLAYING:
+      // Rainbow theme ONLY during active playback - STRICT check
+      // If playbackActive is false, immediately switch to random RGB (playback ended)
+      if(playbackActive == true && ledState == LS_PLAYING){
+        // Only show rainbow if playback is actually active
+        ledRainbowStepFast();
+      } else {
+        // Playback ended - immediately stop rainbow and switch to random RGB
+        playbackActive = false; // Ensure flag is cleared
         ledState = LS_RANDOM_RGB;
         lastActivityMs = now;
         lastRandomRgbChange = now;
+        ledRandomRgb(); // Stop rainbow immediately, show random RGB
+        Serial.println("[LED] playback ended in loop - rainbow stopped");
       }
       break;
     case LS_RANDOM_RGB:
-      // Handled above
       break;
     case LS_DISCONNECTED:
       ledFill(0,0,255); // Blue - WiFi disconnected
@@ -1452,11 +1513,12 @@ void loop(){
     case LS_RESET:
       ledFill(255,0,0); // Red - Factory reset
       break;
+    case LS_BOOT:
+    case LS_PROVISION:
+      break;
     default: 
       break;
   }
 
-  // Activity tick
-  if(mqttClient.connected()) lastActivityMs = now;
   delay(4);
 }
